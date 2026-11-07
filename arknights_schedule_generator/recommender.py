@@ -105,6 +105,7 @@ class CandidateWorkerConfig:
     roster_cache_key: str
     data_cache_key: str
     profile_runtime: bool = False
+    optimizer: str = "hybrid"
 
 
 _CANDIDATE_WORKER_CONFIG: CandidateWorkerConfig | None = None
@@ -125,7 +126,7 @@ def evaluate_candidate_spec(
     config: CandidateWorkerConfig,
     spec: CandidateSpec,
 ) -> dict[str, Any]:
-    optimizer = ScheduleOptimizer(
+    optimizer = resolve_optimizer_class(config.optimizer)(
         config.game_data,
         config.roster,
         allow_upgrades=spec.allow_upgrades,
@@ -167,6 +168,7 @@ def evaluate_candidate_spec(
         max_drone_cycle_repeats=config.max_drone_cycle_repeats,
         upgrade_cost_weight=spec.profile_weight,
         shift_times=config.shift_times,
+        optimizer=config.optimizer,
     )
     if config.cache_policy == "auto":
         cached = load_cached_candidate_evaluation(
@@ -180,7 +182,9 @@ def evaluate_candidate_spec(
             output_dir=config.output_dir,
             expected_max_groups=ScheduleOptimizer.diagnostic_insertion_group_limit(),
             expected_joint_candidate_limit=ScheduleOptimizer.joint_production_candidate_limit(),
-            expected_optimizer_model_version=ScheduleOptimizer.optimizer_model_version(),
+            expected_optimizer_model_version=resolve_optimizer_class(
+            config.optimizer
+        ).optimizer_model_version(),
             expected_anchor_count=len(spec.anchor_preference),
             expected_target_counts=spec.expected_target_counts,
             expected_pure_gold_target=config.pure_gold_target,
@@ -349,6 +353,20 @@ def data_cache_fingerprint(game_data: GameData) -> str:
     )
 
 
+def resolve_optimizer_class(name: str | None):
+    """把优化器名字解析成类；默认保持旧的混合搜索。"""
+    normalized = (name or "hybrid").strip().lower()
+    if normalized in {"hybrid", "search", ""}:
+        return ScheduleOptimizer
+    if normalized in {"graph", "gnn", "gcn"}:
+        from .graph_optimizer import GraphScheduleOptimizer
+
+        return GraphScheduleOptimizer
+    raise ValueError(
+        f"未知优化器 {name!r}；可选 hybrid 或 graph。"
+    )
+
+
 def candidate_cache_key(
     *,
     candidate_id: str,
@@ -378,7 +396,9 @@ def candidate_cache_key(
     max_drone_cycle_repeats: int,
     upgrade_cost_weight: float,
     shift_times: list[str] | None,
+    optimizer: str = "hybrid",
 ) -> str:
+    optimizer_class = resolve_optimizer_class(optimizer)
     return stable_hash(
         {
             "version": 2,
@@ -419,9 +439,10 @@ def candidate_cache_key(
                 "maxDroneCycleRepeats": max(1, int(max_drone_cycle_repeats)),
             },
             "optimizer": {
-                "modelVersion": ScheduleOptimizer.optimizer_model_version(),
-                "maxGroups": ScheduleOptimizer.diagnostic_insertion_group_limit(),
-                "jointCandidateLimit": ScheduleOptimizer.joint_production_candidate_limit(),
+                "name": (optimizer or "hybrid").strip().lower(),
+                "modelVersion": optimizer_class.optimizer_model_version(),
+                "maxGroups": optimizer_class.diagnostic_insertion_group_limit(),
+                "jointCandidateLimit": optimizer_class.joint_production_candidate_limit(),
             },
         }
     )
@@ -492,7 +513,10 @@ def recommend_schedules(
     jobs: str | int = 1,
     cache_policy: str = "auto",
     profile_runtime: bool = False,
+    optimizer: str = "hybrid",
 ) -> dict[str, Any]:
+    optimizer_name = (optimizer or "hybrid").strip().lower()
+    resolve_optimizer_class(optimizer_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_dir = output_dir / "candidate_schedules"
     candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -625,6 +649,7 @@ def recommend_schedules(
             max_drone_cycle_repeats=max_drone_cycle_repeats,
             upgrade_cost_weight=profile_weight,
             shift_times=shift_times,
+            optimizer=optimizer_name,
         )
         if cache_policy == "auto":
             cached = load_cached_candidate_evaluation(
@@ -636,9 +661,15 @@ def recommend_schedules(
                 profile_label=profile_label,
                 baseline_score=baseline_score,
                 output_dir=output_dir,
-                expected_max_groups=ScheduleOptimizer.diagnostic_insertion_group_limit(),
-                expected_joint_candidate_limit=ScheduleOptimizer.joint_production_candidate_limit(),
-                expected_optimizer_model_version=ScheduleOptimizer.optimizer_model_version(),
+                expected_max_groups=resolve_optimizer_class(
+                    optimizer_name
+                ).diagnostic_insertion_group_limit(),
+                expected_joint_candidate_limit=resolve_optimizer_class(
+                    optimizer_name
+                ).joint_production_candidate_limit(),
+                expected_optimizer_model_version=resolve_optimizer_class(
+                    optimizer_name
+                ).optimizer_model_version(),
                 expected_anchor_count=len(anchor_preference),
                 expected_target_counts=expected_target_counts,
                 expected_pure_gold_target=pure_gold_target,
@@ -957,6 +988,7 @@ def recommend_schedules(
             roster_cache_key=roster_cache_key,
             data_cache_key=data_cache_key,
             profile_runtime=profile_runtime,
+            optimizer=optimizer_name,
         )
         if parallel_specs:
             with ProcessPoolExecutor(
@@ -986,7 +1018,7 @@ def recommend_schedules(
         profiles_to_optimize = []
 
     for profile, profile_label, allow_upgrades, profile_weight in profiles_to_optimize:
-        optimizer = ScheduleOptimizer(
+        optimizer = resolve_optimizer_class(optimizer_name)(
             game_data,
             roster_list,
             allow_upgrades=allow_upgrades,

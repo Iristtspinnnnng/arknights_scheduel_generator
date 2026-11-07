@@ -72,6 +72,7 @@ python -m arknights_schedule_generator generate `
 - `--shift-count` / `--shift-hours` / `--shift-times`: 班次数量、时长和起始时间。
 - `--drone-policy`: `none`、`lmd-trade`、`gold-factory`、`shard-factory`、`exp-factory` 或 `auto`。
 - `--allow-upgrades`: 允许把未解锁但可通过升级获得的基建技能纳入规划。
+- `--optimizer`: `hybrid`（默认，穷举组合）或 `graph`（图卷积短名单），见下文「两套优化算法」。
 
 ## 评分已有排班
 
@@ -100,6 +101,37 @@ python -m arknights_schedule_generator recommend `
 ```
 
 推荐流程会写出 JSON 报告、HTML 阅读报告和候选排班文件。默认只评估当前练度；需要补练建议时加 `--allow-upgrades`。
+
+## 两套优化算法
+
+`generate` 和 `recommend` 都有 `--optimizer` 开关，默认 `hybrid`（旧的混合搜索）：
+
+| 取值 | 房间组合怎么定 | 适合 |
+| --- | --- | --- |
+| `hybrid` | 穷举候选池的全部 `C(32,3)` 组合，逐个调用生产模拟器打分 | 默认，行为最保守 |
+| `graph` | 固定超参图卷积 + 闭式读出层给组合打分，只把前 64 名送进同一个模拟器复核 | 想更快、或想看干支路依赖时 |
+
+两者共用同一套收益口径（`ProductionSimulator`）、同一套班次/宿舍/循环边界约束和同一份导出契约，
+所以结果可以直接对比。
+
+```powershell
+# 用图卷积优化器生成
+python -m arknights_schedule_generator generate `
+  --roster .\examples\fixtures\yituliu_full_roster_maxed.xlsx `
+  --data-dir .\data\cache --layout 243 --mode balanced-orundum `
+  --optimizer graph --output .\outputs\schedule_243_graph.json
+
+# 静态图体检：仓库里的数据到底提供了哪些羁绊/增益/舱室信息
+python -m arknights_schedule_generator graph-audit `
+  --roster .\examples\fixtures\yituliu_full_roster_maxed.xlsx --data-dir .\data\cache
+
+# 新旧算法对照基准（JSON + Markdown）
+python -m arknights_schedule_generator benchmark `
+  --roster .\examples\fixtures\yituliu_full_roster_maxed.xlsx `
+  --data-dir .\data\cache --output-dir .\outputs\benchmark
+```
+
+算法细节、静态图的数据来源和实测对照结果见 [docs/graph_optimizer.md](docs/graph_optimizer.md)。
 
 ## 示例
 
@@ -132,7 +164,13 @@ python -m arknights_schedule_generator generate `
 
 ```text
 arknights_schedule_generator/  核心包和 CLI
+  optimizer.py                 旧的混合搜索优化器
+  graph_features.py            静态干员关系图（阵营/点名羁绊/组合机制）
+  graph_conv.py                固定超参图卷积 + 闭式岭回归读出层
+  graph_optimizer.py           图卷积优化器（同一 OptimizerResult 契约）
+  graph_benchmark.py           新旧算法对照基准
 tests/                         单元测试和回归测试
+docs/graph_optimizer.md        图优化器的数据审计、算法与实测结论
 examples/                      少量公开示例
 data/cache/                    本地游戏数据缓存，默认忽略
 outputs/                       本地生成结果，默认忽略

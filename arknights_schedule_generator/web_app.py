@@ -31,6 +31,7 @@ DRONE_POLICIES = ("none", "lmd-trade", "gold-factory", "shard-factory", "exp-fac
 SHARD_FORMULAS = ("rock", "device")
 CACHE_POLICIES = ("auto", "refresh", "off")
 APP_DEFAULTS_MARKER = "arknights-schedule-generator-ui"
+OPTIMIZERS = ("hybrid", "graph")
 
 
 @dataclass(frozen=True)
@@ -256,6 +257,7 @@ def run_recommendation(form: ParsedForm, root_dir: Path) -> dict[str, Any]:
         max_drone_cycle_repeats=int_field(form, "max_drone_cycle_repeats", DEFAULT_MAX_DRONE_CYCLE_REPEATS),
         jobs=form.text("jobs", "auto") or "auto",
         cache_policy=choice_field(form, "cache_policy", CACHE_POLICIES, "auto"),
+        optimizer=choice_field(form, "optimizer", OPTIMIZERS, "hybrid"),
         profile_runtime=form.checked("profile_runtime"),
     )
     payload = response_payload(report, root_dir, form.checked("no_enforce_baseline"))
@@ -446,6 +448,7 @@ def default_payload(root_dir: Path) -> dict[str, Any]:
         "dronePolicies": list(DRONE_POLICIES),
         "shardFormulas": list(SHARD_FORMULAS),
         "cachePolicies": list(CACHE_POLICIES),
+        "optimizers": list(OPTIMIZERS),
         "values": {
             "shiftCount": 2,
             "shiftHours": 12,
@@ -453,6 +456,7 @@ def default_payload(root_dir: Path) -> dict[str, Any]:
             "rightSide": "full",
             "shardFormula": "rock",
             "cachePolicy": "auto",
+            "optimizer": "hybrid",
             "jobs": "auto",
             "upgradeCostWeight": 0.015,
             "pureGoldTarget": DEFAULT_PURE_GOLD_TARGET_PER_DAY,
@@ -793,6 +797,9 @@ INDEX_HTML = """<!doctype html>
           <label>候选缓存
             <select name="cache_policy"></select>
           </label>
+          <label>优化算法
+            <select name="optimizer"></select>
+          </label>
         </div>
       </fieldset>
 
@@ -916,6 +923,7 @@ INDEX_HTML = """<!doctype html>
       fillSelect(form.drone_policy, defaults.dronePolicies, defaults.values.dronePolicy);
       fillSelect(form.shard_formula, defaults.shardFormulas, defaults.values.shardFormula);
       fillSelect(form.cache_policy, defaults.cachePolicies, defaults.values.cachePolicy);
+  fillSelect(form.optimizer, defaults.optimizers, defaults.values.optimizer || "hybrid");
       fillChecks(document.getElementById("layoutChecks"), "layouts", defaults.layouts, defaults.layouts);
       fillChecks(document.getElementById("modeChecks"), "modes", defaults.modes, defaults.modes);
     }

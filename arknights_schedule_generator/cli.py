@@ -8,7 +8,15 @@ from .calibration import build_calibration_report
 from .data import GameData, download_data
 from .exporter import write_result_json
 from .full_roster import write_full_roster_xlsx
-from .optimizer import ScheduleOptimizer, apply_layout_variant, parse_layout
+from .graph_benchmark import (
+    DEFAULT_BENCHMARK_CASES,
+    BenchmarkCase,
+    run_benchmark,
+    write_benchmark_report,
+)
+from .graph_features import build_operator_graph
+from .graph_optimizer import GraphOptimizerConfig
+from .optimizer import apply_layout_variant, parse_layout
 from .power import RIGHT_SIDE_PRESETS, apply_right_side_preset
 from .production import (
     DEFAULT_MAX_DRONE_CYCLE_REPEATS,
@@ -16,9 +24,21 @@ from .production import (
     DEFAULT_PURE_GOLD_TOLERANCE,
     ProductionSimulator,
 )
-from .recommender import DEFAULT_LAYOUTS, DEFAULT_MODES, recommend_schedules
+from .recommender import (
+    DEFAULT_LAYOUTS,
+    DEFAULT_MODES,
+    recommend_schedules,
+    resolve_optimizer_class,
+)
 from .roster import load_roster_xlsx
 from .schedule_import import load_yituliu_schedule
+
+OPTIMIZER_CHOICES = ("hybrid", "graph")
+
+
+def optimizer_class(name: str):
+    """把 ``--optimizer`` 的取值映射到优化器类（和推荐器共用同一份解析）。"""
+    return resolve_optimizer_class(name)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,6 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         return make_full_roster(args)
     if args.command == "calibrate":
         return calibrate(args)
+    if args.command == "graph-audit":
+        return graph_audit(args)
+    if args.command == "benchmark":
+        return benchmark(args)
     parser.print_help()
     return 1
 
@@ -102,6 +126,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile-runtime",
         action="store_true",
         help="Attach optimizer runtime counters and cache statistics under analysis.runtimeProfile.",
+    )
+    generate_parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="hybrid",
+        help=(
+            "Search algorithm: hybrid does exhaustive room-combo enumeration plus local search; "
+            "graph uses a fixed-hyperparameter graph convolution surrogate to shortlist combos."
+        ),
     )
     generate_parser.add_argument("--output", default="outputs/schedule.json")
 
@@ -217,6 +250,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reuse candidate schedule JSON when the input fingerprint matches; refresh recomputes and off disables reads.",
     )
     recommend_parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="hybrid",
+        help=(
+            "Search algorithm for each candidate: hybrid (exhaustive combo enumeration) "
+            "or graph (fixed-hyperparameter graph convolution surrogate)."
+        ),
+    )
+    recommend_parser.add_argument(
         "--profile-runtime",
         action="store_true",
         help="Attach optimizer runtime counters and cache statistics under each generated schedule analysis.runtimeProfile.",
@@ -284,7 +326,155 @@ def build_parser() -> argparse.ArgumentParser:
         default="outputs/fixtures/yituliu_full_roster_maxed.xlsx",
         help="Output .xlsx path.",
     )
+
+    audit_parser = subparsers.add_parser(
+        "graph-audit",
+        help="Report what static graph information (factions, bonds, rooms) the local data provides.",
+    )
+    add_common_data_args(audit_parser)
+    audit_parser.add_argument("--limit", type=int, default=12, help="How many example rows to print.")
+    audit_parser.add_argument("--output", default=None, help="Optional JSON output path.")
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="Compare the graph-convolution optimizer against the hybrid search optimizer.",
+    )
+    add_common_data_args(benchmark_parser)
+    benchmark_parser.add_argument(
+        "--cases",
+        default=None,
+        help="Comma-separated case ids from the default set, or omit for all default cases.",
+    )
+    benchmark_parser.add_argument(
+        "--layouts",
+        default=None,
+        help="Build cases from these layouts instead, e.g. 243,342.",
+    )
+    benchmark_parser.add_argument("--modes", default="normal,balanced-orundum,max-orundum")
+    benchmark_parser.add_argument(
+        "--shift-patterns",
+        default="2x12,3x8",
+        help="Comma-separated shift patterns like 2x12,3x8.",
+    )
+    benchmark_parser.add_argument(
+        "--drone-policies",
+        default="none",
+        help="Comma-separated drone policies to combine with each case.",
+    )
+    benchmark_parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="Repeat each run and keep the fastest wall time.",
+    )
+    benchmark_parser.add_argument(
+        "--skip-hybrid",
+        action="store_true",
+        help="Only run the graph optimizer (useful when the hybrid run is too slow).",
+    )
+    benchmark_parser.add_argument(
+        "--shortlist",
+        type=int,
+        default=None,
+        help="Override the graph shortlist size (default 64).",
+    )
+    benchmark_parser.add_argument(
+        "--insertion-budget",
+        type=int,
+        default=None,
+        help="Override the graph optimizer insertion group budget (default 24).",
+    )
+    benchmark_parser.add_argument("--output-dir", default="outputs/benchmark")
     return parser
+
+
+def graph_audit(args: argparse.Namespace) -> int:
+    """回答“仓库里的数据够不够搭静态图”。"""
+    game_data = load_game_data(args)
+    roster = load_roster_xlsx(Path(args.roster))
+    graph = build_operator_graph(game_data, roster)
+    report = graph.audit_report(limit=args.limit)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"已写入静态图体检报告: {output_path}")
+    print(f"干员节点: {report['nodeCount']}（练度表 {len(roster)} 行，同名已合并）")
+    print(f"特征宽度: {report['featureWidth']}")
+    print(f"阵营组: {report['factionGroupCount']}")
+    print(f"边: {json.dumps(report['edgeCountByRelation'], ensure_ascii=False)}")
+    print(f"显式羁绊对数: {report['namedDependencyPairCount']}")
+    for pair in report["namedDependencyPairs"]:
+        print(f"- {pair}")
+    print(f"孤立干员: {report['isolatedOperatorCount']}")
+    return 0
+
+
+def benchmark(args: argparse.Namespace) -> int:
+    game_data = load_game_data(args)
+    roster = load_roster_xlsx(Path(args.roster))
+    cases = build_benchmark_cases(args)
+    config_kwargs = {}
+    if args.shortlist:
+        config_kwargs["shortlist"] = args.shortlist
+    if args.insertion_budget:
+        config_kwargs["insertion_group_budget"] = args.insertion_budget
+    report = run_benchmark(
+        game_data,
+        roster,
+        cases=cases,
+        graph_config=GraphOptimizerConfig(**config_kwargs),
+        include_hybrid=not args.skip_hybrid,
+        repetitions=args.repetitions,
+    )
+    json_path, md_path = write_benchmark_report(report, Path(args.output_dir))
+    summary = report.get("summary") or {}
+    print(f"已写入基准报告: {json_path}")
+    print(f"已写入人读报告: {md_path}")
+    print(
+        "结果: "
+        f"{summary.get('wins')} 胜 / {summary.get('losses')} 负 / {summary.get('ties')} 平；"
+        f"平均分数比 {summary.get('meanScoreRatio')}；"
+        f"平均模拟器调用比 {summary.get('meanEvaluateRoomRatio')}；"
+        f"平均墙钟比 {summary.get('meanWallRatio')}"
+    )
+    return 0
+
+
+def build_benchmark_cases(args: argparse.Namespace) -> list[BenchmarkCase]:
+    if args.layouts:
+        layouts = [item.strip() for item in args.layouts.split(",") if item.strip()]
+        modes = [item.strip() for item in args.modes.split(",") if item.strip()]
+        patterns = [item.strip() for item in args.shift_patterns.split(",") if item.strip()]
+        drones = [item.strip() for item in args.drone_policies.split(",") if item.strip()]
+        cases: list[BenchmarkCase] = []
+        for layout in layouts:
+            for mode in modes:
+                for pattern in patterns:
+                    count_text, hours_text = pattern.lower().split("x")
+                    for drone in drones:
+                        case_id = f"{layout}-{mode}-{pattern}-{drone}"
+                        cases.append(
+                            BenchmarkCase(
+                                case_id,
+                                layout,
+                                mode,
+                                int(count_text),
+                                int(hours_text),
+                                drone,
+                            )
+                        )
+        return cases
+    if not args.cases:
+        return list(DEFAULT_BENCHMARK_CASES)
+    wanted = {item.strip() for item in args.cases.split(",") if item.strip()}
+    selected = [case for case in DEFAULT_BENCHMARK_CASES if case.id in wanted]
+    if not selected:
+        available = ", ".join(case.id for case in DEFAULT_BENCHMARK_CASES)
+        raise ValueError(f"未知基准场景；可用: {available}")
+    return selected
 
 
 def add_common_data_args(parser: argparse.ArgumentParser) -> None:
@@ -348,7 +538,8 @@ def generate(args: argparse.Namespace) -> int:
         apply_layout_variant(parse_layout(args.layout), args.layout_variant),
         args.right_side,
     )
-    optimizer = ScheduleOptimizer(
+    classifier = optimizer_class(args.optimizer)
+    optimizer = classifier(
         game_data,
         roster,
         allow_upgrades=args.allow_upgrades,
@@ -458,6 +649,7 @@ def recommend(args: argparse.Namespace) -> int:
         jobs=args.jobs,
         cache_policy=args.cache_policy,
         profile_runtime=args.profile_runtime,
+        optimizer=args.optimizer,
     )
     written = report["writtenFiles"]
     print(f"已写入推荐报告: {written['report']}")

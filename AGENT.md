@@ -59,6 +59,14 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
 ## 当前可信状态
 
 - 收益模型已经从“技能百分比总分”转为资源流模型，核心字段是 `dailyExpected` 和 `scoreBreakdown`。
+- 现在有两套优化器，共用同一收益口径、同一约束和同一 `OptimizerResult` 契约：
+  - `hybrid`（默认，`optimizer.py`）：房间组合全量枚举 + 插入/替换局部搜索。
+  - `graph`（`graph_optimizer.py`）：固定超参图卷积短名单 + 同模拟器精确复核。
+    数据审计、算法与实测对照见 `docs/graph_optimizer.md`。
+- 实测（满练 447 行练度表，同进程）：图卷积综合分平均 **1.030 倍**，模拟器调用 **0.672 倍**，
+  墙钟约持平；逐房间短名单在 5/5 采样规格上仍取到全量枚举最优。
+- 图卷积的静态图信息来自 `data/cache`：55 个阵营组、36 对技能点名羁绊、2252 条组合机制边。
+  数值强度不在数据字段里（`buff.efficiency` 多为 0），所以读出层用 `ProductionSimulator` 当老师标定。
 - 一图流 2026-06「泡影苍霆」版本样例已作为主要校准源：
   - 视频源：`BV19jVZ69Evp`
   - 静态 `243 搓玉 一天两换`：标注 `30.6k LMD + 14.7k / 18.9k EXP / 582 玉`，公式复现通过。
@@ -105,6 +113,25 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
 ```powershell
 conda run -n arknights-schedule-generator python -m unittest discover -s tests -p 'test*.py'
 ```
+
+```powershell
+conda run -n arknights-schedule-generator python -m arknights_schedule_generator.cli graph-audit `
+  --roster examples\fixtures\yituliu_full_roster_maxed.xlsx `
+  --data-dir data\cache `
+  --output outputs\graph_audit.json
+```
+
+```powershell
+conda run -n arknights-schedule-generator python -m arknights_schedule_generator.cli benchmark `
+  --roster examples\fixtures\yituliu_full_roster_maxed.xlsx `
+  --data-dir data\cache `
+  --output-dir outputs\benchmark
+```
+
+- `benchmark` 默认跑 4 个场景、每场景两套算法，耗时数分钟；用 `--cases` 只跑子集
+  （`243-balanced-2x12` / `243-normal-2x12` / `252-balanced-3x8-auto` / `342-max-3x8-auto`），
+  或用 `--layouts/--modes/--shift-patterns/--drone-policies` 自定义组合。
+- 新旧算法都能用 `--optimizer hybrid|graph` 切换（`generate` 和 `recommend` 都支持）。
 
 ## 关键口径
 

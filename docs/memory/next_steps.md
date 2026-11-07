@@ -804,3 +804,41 @@ Acceptance criteria:
 Broaden dependency parsing beyond explicit room-name windows while preserving conservative report semantics.
 
 Start with high-confidence alias/faction dependency patterns and add tests that prove reports distinguish "diagnosed but not searched", "searched and rejected", "accepted in the final schedule", and "historically accepted but displaced".
+
+## P5 - Graph Convolution Optimizer (implemented)
+
+Status: implemented and benchmarked on the local full-roster fixture.
+
+Delivered:
+- `arknights_schedule_generator/graph_features.py` builds a static operator graph from `data/cache`:
+  438 nodes, 55 faction groups (13584 faction edges), 36 named-bond pairs (72 directed edges),
+  2252 combo-mechanism edges. `graph-audit` CLI prints the audit.
+- `arknights_schedule_generator/graph_conv.py` is a fixed-hyperparameter graph convolution
+  (deterministic sparse random projections, SplitMix64 seeded) plus a closed-form ridge readout
+  (unary + pairwise set function) fitted on `ProductionSimulator` labels. No torch/numpy dependency.
+- `arknights_schedule_generator/graph_optimizer.py` is `GraphScheduleOptimizer(ScheduleOptimizer)`:
+  same objective, same shift/dormitory/cycle constraints, same `OptimizerResult` contract;
+  only candidate generation changes (surrogate shortlist + exact simulator re-scoring).
+- `arknights_schedule_generator/graph_benchmark.py` + `benchmark` CLI compares both algorithms.
+- `docs/graph_optimizer.md` records the data audit, algorithm, and measured comparison.
+
+Measured (447-row maxed roster, same process):
+- Score ratio vs hybrid: 1.030 mean (3 wins / 0 losses), best case 342 max-orundum +4.81%.
+- Simulator calls: 0.672x (33% fewer). Wall clock: 1.026x (parity).
+- Per-room shortlist keeps the exhaustive optimum on 5/5 sampled specs while shrinking
+  ~4800 combos to ~80.
+
+Known constraints and next steps:
+- Wall clock parity rather than improvement: shortlist assembly is Python-level work while the old
+  algorithm's combinatorics run in C. Batch the readout in numpy, or persist a
+  "room spec -> combo list" table, before claiming a speed win.
+- L3 Orundum trading rooms are zero-gradient (guide lookup pins them at 132%), so the model can only
+  return a constant there.
+- Step-function guide lookups (16 LMD rows, 3 manufacture rows) must be injected as mechanism
+  hyperedges; they cannot be learned by a linear readout. New operators/mechanisms require keeping
+  that table in sync, same as the old algorithm.
+- The insertion-search budget (48 groups / 4 passes) is a lossy tradeoff against the parent's
+  64 groups / 8 passes. It happened to improve score on the maxed fixture; do not treat it as a
+  guarantee on partial rosters.
+- `tests/test_graph_optimizer.py` covers graph building, encoder determinism, the closed-form solver,
+  readout fit quality, optimizer contract, and real-data shortlist recall.
