@@ -18,6 +18,12 @@ from tempfile import TemporaryDirectory
 
 from arknights_schedule_generator.data import GameData
 from arknights_schedule_generator.exporter import find_conflicts
+from arknights_schedule_generator.graph_bonds import (
+    BondBasis,
+    build_bond_basis,
+    in_room_count_tags,
+)
+from arknights_schedule_generator.graph_cache import CACHE_SCHEMA_VERSION, GraphModelCache
 from arknights_schedule_generator.graph_conv import (
     EncoderConfig,
     GraphEncoder,
@@ -25,6 +31,7 @@ from arknights_schedule_generator.graph_conv import (
     _solve_ridge,
     _spearman,
     fit_room_value_model,
+    numpy_available,
     rank_combinations,
 )
 from arknights_schedule_generator.graph_features import (
@@ -446,6 +453,33 @@ class GraphOptimizerContractTest(unittest.TestCase):
         self.assertGreater(len(exhaustive), 100)
         self.assertLess(len(shortlist), len(exhaustive) / 2)
 
+    def test_multi_start_initial_assignment_is_at_least_as_good_as_each_start(self) -> None:
+        """多起手必须不劣于任何单起手（它就是在同一个目标函数里取最大值）。"""
+        layout = self.layout
+        kwargs = dict(mode="normal", shift_count=2, shift_hours=12, drone_policy="none")
+        single_scores = []
+        for budget in (12, 0):
+            optimizer = GraphScheduleOptimizer(
+                self.game_data,
+                self.roster,
+                shard_formula="rock",
+                graph_config=GraphOptimizerConfig(
+                    use_cache=False, initial_starts=(budget,)
+                ),
+            )
+            single_scores.append(
+                optimizer.optimize(layout, **kwargs).score
+            )
+        multi = GraphScheduleOptimizer(
+            self.game_data,
+            self.roster,
+            shard_formula="rock",
+            graph_config=GraphOptimizerConfig(use_cache=False, initial_starts=(12, 0)),
+        )
+        multi_score = multi.optimize(layout, **kwargs).score
+        self.assertGreaterEqual(multi_score + 1e-6, max(single_scores))
+        self.assertEqual(multi.graph_stats["starts"]["budgets"], [12, 0])
+
     def test_disabling_candidate_closure_matches_parent_pool(self) -> None:
         hybrid = ScheduleOptimizer(self.game_data, self.roster, shard_formula="rock")
         graph = GraphScheduleOptimizer(
@@ -458,6 +492,167 @@ class GraphOptimizerContractTest(unittest.TestCase):
             hybrid._combo_candidate_pool("TRADING", "O_GOLD", set()),
             graph._combo_candidate_pool("TRADING", "O_GOLD", set()),
         )
+
+
+class BondBasisTest(unittest.TestCase):
+    """显式羁绊基：只在语义成立的房间/产物上开，且别名标签要合并。"""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.data_dir = Path(self._temp.name)
+        write_graph_test_data(self.data_dir)
+        self.game_data = GameData.load(self.data_dir)
+        self.roster = build_test_roster()
+        self.graph = build_operator_graph(self.game_data, self.roster)
+        self.names = [name for name, *_ in TRADING_OPERATORS]
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_in_room_tags_are_room_and_target_aware(self) -> None:
+        self.assertEqual(in_room_count_tags("TRADING", "O_GOLD"), ("glasgow", "laterano", "mh2"))
+        self.assertEqual(in_room_count_tags("TRADING", "O_DIAMOND"), ())
+        self.assertEqual(in_room_count_tags("MANUFACTURE", "F_EXP"), ("A1", "ussg"))
+        # 黑钢/莱茵用的是全基建计数，不能当房间级一元项
+        self.assertNotIn("blacksteel", in_room_count_tags("MANUFACTURE", "F_GOLD"))
+
+    def test_basis_marks_faction_membership_and_named_pairs(self) -> None:
+        basis = build_bond_basis(
+            self.graph, room_type="TRADING", target="O_GOLD", candidate_names=self.names
+        )
+        self.assertIn("siracusa", basis.tags)
+        siracusa_flag = basis.unary_features("德克萨斯")[basis.tags.index("siracusa")]
+        self.assertEqual(siracusa_flag, 1.0)
+        self.assertEqual(basis.unary_features("能天使")[basis.tags.index("siracusa")], 0.0)
+        # 德克萨斯与拉普兰德互为点名羁绊
+        forward = basis.pair_features("拉普兰德", "德克萨斯")
+        self.assertEqual(forward[0], 1.0)  # 拉普兰德点名德克萨斯
+        self.assertEqual(basis.pair_features("德克萨斯", "拉普兰德")[1], 1.0)
+
+    def test_alias_tags_are_deduplicated(self) -> None:
+        basis = build_bond_basis(
+            self.graph, room_type="TRADING", target="O_GOLD", candidate_names=self.names
+        )
+        signatures = [frozenset(basis.members[tag]) for tag in basis.tags]
+        self.assertEqual(len(signatures), len(set(signatures)))
+
+    def test_basis_serialisation_round_trip(self) -> None:
+        basis = build_bond_basis(
+            self.graph, room_type="TRADING", target="O_GOLD", candidate_names=self.names
+        )
+        restored = BondBasis.from_dict(basis.to_dict())
+        self.assertEqual(restored.tags, basis.tags)
+        self.assertEqual(restored.named, basis.named)
+        for name in self.names[:5]:
+            self.assertEqual(restored.unary_features(name), basis.unary_features(name))
+
+
+class NumpyEquivalenceTest(unittest.TestCase):
+    """numpy 加速路径必须和纯 Python 路径给出同一个答案。"""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.data_dir = Path(self._temp.name)
+        write_graph_test_data(self.data_dir)
+        self.game_data = GameData.load(self.data_dir)
+        self.graph = build_operator_graph(self.game_data, build_test_roster())
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_encoder_paths_agree(self) -> None:
+        encoder = GraphEncoder(self.graph, EncoderConfig(hidden_dim=6, layers=2, seed=99))
+        vectorised = encoder.embeddings()
+        reference = encoder._embeddings_python()
+        self.assertEqual(len(vectorised), len(reference))
+        for left, right in zip(vectorised, reference):
+            for a, b in zip(left, right):
+                self.assertAlmostEqual(a, b, places=9)
+
+    def test_ridge_paths_agree(self) -> None:
+        from unittest import mock
+
+        from arknights_schedule_generator import graph_conv
+
+        rows = [
+            [1.0, 0.5, 0.0],
+            [0.0, 1.0, -0.5],
+            [1.0, 1.0, 1.0],
+            [2.0, -1.0, 0.5],
+            [0.5, 0.25, 1.5],
+            [0.25, 2.0, -1.0],
+        ]
+        targets = [1.0, -2.0, 3.5, 0.5, 2.0, -1.25]
+        vectorised = _solve_ridge(rows, targets, ridge=0.05)
+        with mock.patch.object(graph_conv, "_np", None):
+            reference = graph_conv._solve_ridge(rows, targets, ridge=0.05)
+        self.assertEqual(len(vectorised), len(reference))
+        for left, right in zip(vectorised, reference):
+            self.assertAlmostEqual(left, right, places=6)
+
+    def test_numpy_probe_reports_availability(self) -> None:
+        self.assertIsInstance(numpy_available(), bool)
+
+
+class GraphModelCacheTest(unittest.TestCase):
+    """磁盘缓存：命中后必须给出完全一致的预测。"""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.cache_dir = Path(self._temp.name) / "cache"
+        self.data_dir = Path(self._temp.name) / "data"
+        self.data_dir.mkdir()
+        write_graph_test_data(self.data_dir)
+        self.game_data = GameData.load(self.data_dir)
+        self.roster = build_test_roster()
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_round_trip_prediction_is_identical(self) -> None:
+        cache = GraphModelCache(directory=self.cache_dir)
+        self.assertTrue(cache.active)
+        payload = {"hello": [1, 2, 3]}
+        key = cache.key(payload)
+        self.assertIsNone(cache.load(key))
+        cache.save(key, {"value": 7.5})
+        loaded = cache.load(key)
+        self.assertEqual(loaded["value"], 7.5)
+        self.assertEqual(loaded["schema"], CACHE_SCHEMA_VERSION)
+
+    def test_optimizer_reuses_fitted_model_from_disk(self) -> None:
+        config = GraphOptimizerConfig(use_cache=True, cache_dir=str(self.cache_dir), fit_samples=96)
+        first = GraphScheduleOptimizer(
+            self.game_data, self.roster, shard_formula="rock", graph_config=config
+        )
+        spec = next(
+            room
+            for room in first._room_specs(parse_layout("243"), "normal")
+            if room.room_type == "TRADING"
+        )
+        first._room_combos(spec, set(), 12.0)
+        self.assertGreater(first._cache.writes, 0)
+
+        second = GraphScheduleOptimizer(
+            self.game_data, self.roster, shard_formula="rock", graph_config=config
+        )
+        second._room_combos(spec, set(), 12.0)
+        self.assertGreater(second._cache.hits, 0)
+        self.assertEqual(second._cache.misses, 0)
+        first_model = first._models[first._model_key(spec, 12.0)]
+        second_model = second._models[second._model_key(spec, 12.0)]
+        assert first_model is not None and second_model is not None
+        self.assertEqual(first_model.unary, second_model.unary)
+        self.assertEqual(first_model.pair, second_model.pair)
+        names = ["能天使", "德克萨斯", "拉普兰德"]
+        embeddings = second._embeddings()
+        available = [name for name in names if name in embeddings]
+        if len(available) == len(names):
+            self.assertAlmostEqual(
+                first_model.score(names, embeddings),
+                second_model.score(names, embeddings),
+                places=12,
+            )
 
 
 class RealDataGraphTest(unittest.TestCase):

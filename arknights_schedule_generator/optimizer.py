@@ -24,6 +24,9 @@ from .production import (
     DEFAULT_PURE_GOLD_TOLERANCE,
     GUIDE_MANUFACTURE_LOOKUPS,
     GUIDE_SPECIAL_TRADE_ANCHORS,
+    ROOM_EFFICIENCY_SCORED_ROOM_TYPES,
+    ROOM_EFFICIENCY_WEIGHTS,
+    TRADE_EQUIVALENT_PERCENT_ROOM_SCORE,
     ProductionReport,
     ProductionSimulator,
     ProductionVector,
@@ -3129,12 +3132,10 @@ class ScheduleOptimizer:
             self._record_runtime_count("roomComboScore.cacheHit")
             return cached
         self._record_runtime_count("roomComboScore.cacheMiss")
-        if spec.room_type == "POWER":
-            effect = evaluate_room_effect(operators, spec.target)
-            score = effect.speed_percent
-        else:
-            vector = self._room_combo_vector(spec, operators, duration_hours)
-            score = room_output_score(spec, vector)
+        # 发电站也走同一套 room_output_score：它的价值按社区权重折算，
+        # 这样「2% 发电 = 1% 贸易」在选人层面也成立，而不是返回裸百分比。
+        vector = self._room_combo_vector(spec, operators, duration_hours)
+        score = room_output_score(spec, vector)
         score -= sum(
             float(skill.upgrade.cost_score if skill.upgrade else 0.0)
             for skill in operators
@@ -3525,6 +3526,12 @@ def room_output_score(spec: RoomSpec, vector: ProductionVector) -> float:
         if spec.target == "F_DIAMOND":
             return score + vector.shardDelta * 12.0 - vector.materialCosts.get("4001", 0.0) / 1000.0 * 5.0
         return score + vector.pureGoldDelta * 8.0
+    if spec.room_type in ROOM_EFFICIENCY_SCORED_ROOM_TYPES:
+        # 发电 / 会客 / 办公室没有资源流收益（发电的无人机只覆盖一小部分），
+        # 按社区权重折算成贸易等价分，保证「2% 发电 = 12% 会客 = ... = 1% 贸易」。
+        weight = ROOM_EFFICIENCY_WEIGHTS[spec.room_type]
+        speed_days = vector.roomSpeedDays.get(spec.room_type, 0.0)
+        return score + speed_days * weight * TRADE_EQUIVALENT_PERCENT_ROOM_SCORE
     return score
 
 

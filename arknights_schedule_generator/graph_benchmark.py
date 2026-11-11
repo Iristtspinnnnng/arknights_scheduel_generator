@@ -421,6 +421,50 @@ def measure_shortlist_recall(
     }
 
 
+def _bond_coefficient_rows(report: dict[str, Any], limit: int = 10) -> list[dict[str, Any]]:
+    """从各场景的模型描述里抽出一份「羁绊系数」示例表。"""
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for payload in report.get("cases") or []:
+        for key, model in (payload.get("models") or {}).items():
+            bonds = (model or {}).get("bonds") or {}
+            room_type, target = key.split(":")[0], key.split(":")[1]
+            faction_rows = [
+                item
+                for item in (bonds.get("factionCounts") or [])
+                if abs(float(item.get("coefficientPerOperator") or 0.0)) > 1e-6
+            ][:limit]
+            for item in faction_rows:
+                identity = (room_type, target, f"faction_count:{item['tag']}")
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                rows.append(
+                    {
+                        "room": room_type,
+                        "target": target,
+                        "feature": f"faction_count:{item['tag']}",
+                        "coefficient": float(item["coefficientPerOperator"]),
+                    }
+                )
+            for item in bonds.get("pairFeatures") or []:
+                if abs(float(item.get("coefficient") or 0.0)) <= 1e-6:
+                    continue
+                identity = (room_type, target, str(item["feature"]))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                rows.append(
+                    {
+                        "room": room_type,
+                        "target": target,
+                        "feature": str(item["feature"]),
+                        "coefficient": float(item["coefficient"]),
+                    }
+                )
+    return rows
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """把基准报告渲染成人读的 Markdown。"""
     lines: list[str] = []
@@ -518,6 +562,28 @@ def render_markdown(report: dict[str, Any]) -> str:
         "此时看 MAE/均值 更实际。"
     )
     add("")
+
+    bond_rows = _bond_coefficient_rows(report)
+    if bond_rows:
+        add("## 显式羁绊基学到的系数")
+        add("")
+        add("读出层里的羁绊项是显式线性基，系数可以直接读出来（单位：分 / 每单位特征）：")
+        add("")
+        add("| 房间 | 目标 | 特征 | 系数 |")
+        add("| --- | --- | --- | --- |")
+        for row in bond_rows:
+            add(
+                f"| {row['room']} | {row['target']} | {row['feature']} | "
+                f"{row['coefficient']:+.3f} |"
+            )
+        add("")
+        add(
+            "`faction_count:*` 是「本房间该阵营每多一人值多少分」，"
+            "`bond:*` 是「一对有羁绊的干员同房值多少分」。"
+            "注意阵营列之间相关性很高，岭回归会把权重分摊到同族标签上，"
+            "绝对值只有排名意义，不宜逐条当作游戏内公式。"
+        )
+        add("")
 
     add("## 每个房间的差异")
     add("")

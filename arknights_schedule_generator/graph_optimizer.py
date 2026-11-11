@@ -21,8 +21,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations as _combinations
+from pathlib import Path
 from typing import Any, Sequence
 
+from .graph_bonds import BondBasis, build_bond_basis
+from .graph_cache import GraphModelCache
 from .graph_conv import (
     EncoderConfig,
     GraphEncoder,
@@ -47,14 +50,24 @@ from .optimizer import (
     insertion_spec_key,
     local_quality_audit,
     repeat_shift_cycle,
+    target_selection_score,
     unique_candidate_variants,
 )
-from .production import pure_gold_balance_quality
+from .presets import normalize_mode
+from .production import (
+    DEFAULT_PURE_GOLD_TARGET_PER_DAY,
+    DEFAULT_PURE_GOLD_TOLERANCE,
+    ProductionSimulator,
+    pure_gold_balance_quality,
+)
 
 __all__ = ["GraphScheduleOptimizer", "GraphOptimizerConfig", "GRAPH_OPTIMIZER_MODEL_VERSION"]
 
 # 和父类区分开，避免推荐器的候选缓存在两种算法之间串用。
 GRAPH_OPTIMIZER_MODEL_VERSION = 100 + OPTIMIZER_MODEL_VERSION
+
+# 特征定义版本：改动节点特征 / 羁绊基 / 读出层结构时必须 +1，否则旧磁盘缓存会失效。
+FEATURE_VERSION = 2
 
 _ROOM_QUERY_ROOM_TYPES = {"TRADING", "MANUFACTURE", "POWER"}
 
@@ -71,13 +84,42 @@ class GraphOptimizerConfig:
     已经覆盖了父类实际会用到的全部候选。"""
     beam: int = 18
     """读出层做一元预筛后保留的干员数；组合枚举规模是 ``C(beam, capacity)``。"""
-    coverage_extra: int = 24
-    """额外的“覆盖保障”候选数：保证候选池里每个干员至少进入一个送审组合。"""
+    lexicographic_prefix: int = 96
+    """额外补进短名单的「枚举顺序前缀」组合数，用于和父类的同分排序对齐。"""
+    initial_starts: tuple[int, ...] = (12, 0)
+    """初始排班的多起手策略：每一项是一个羁绊闭包预算；用同一个目标函数择优。
+
+    默认 (12, 0) = 「开闭包」和「关掉闭包」各生成一套初始排班，再选更好的。
+    这套做法把「同一开关在不同场景符号相反」的问题变成取最大值，代价是
+    多几轮 beam 搜索和每套一次 ``simulator.evaluate``。设为 ``(12,)`` 可回到单起手。"""
+    bond_closure_budget: int = 12
+    """羁绊闭包预算：最多为多少个「有 named 伙伴」的干员定向提名一个组合。"""
+    coverage_extra: int = 0
+    """覆盖保障预算：保证候选池里每个干员至少进入一个送审组合。
+
+    默认 0（关闭）：实测它把一批低一元分的干员强行塞进短名单，会打乱同分组合的先后，
+    在 243/不搓玉 上净损失约 9 分。羁绊归 ``bond_closure_budget`` 管，两者已拆开。"""
     mechanism_partner_pool: int = 12
     """机制超边补齐伙伴时，从一元排名前几名里取。"""
     mechanism_keep: int = 16
     """机制超边按精确分数保留前几个（每个房间规格只算一次，之后缓存）。"""
+    use_bonds: bool = True
+    """是否把阵营人数 / 点名羁绊写成显式线性特征（系数可直接读出）。"""
+    bond_max_tags: int = 24
+    """显式阵营基的标签上限，直接决定读出层多出来的参数个数。"""
+    bond_ridge_scale: float = 4.0
+    """显式羁绊基的收缩强度相对嵌入基的倍数（样本少、列少，需要更强正则）。"""
+    use_cache: bool = True
+    """是否把拟合好的读出层与机制超边落盘复用（跨进程）。"""
+    cache_dir: str | None = "outputs/graph_model_cache"
+    """缓存目录；None 表示只用内存缓存。"""
     fit_samples: int = 288
+    """拟合读出层时采样的房间组合数。
+
+    注意这里**不是**越大越好：读数层的角色是「提名」而不是「预测」。实测把样本从 288
+    加到 1536，holdout R² 从 0.82 升到 0.88、MAE 从 2.4 降到 1.5，但最终排班分数反而
+    系统性下降约 4%——因为模型越锐利，短名单越集中在同一批干员上，下游 beam 搜索失去
+    多样性。若哪天给短名单加了显式多样性约束，可以再把这 个值调高。"""
     ridge: float = 1.0
     min_fit_samples: int = 24
     candidate_closure: bool = True
@@ -86,8 +128,9 @@ class GraphOptimizerConfig:
     """只记录图模型的推荐而不真正改变搜索（用于诊断/对照）。"""
     prefer_score_within_tolerance: bool = True
     """纯赤金平衡的循环重复次数：在容差内选分数最高的，而不是第一个达标的。"""
-    limit_insertion_search: bool = True
-    """是否用图先验 + 预算限制插入搜索（父类会穷举所有插入组、多轮 + 一次诊断复核）。"""
+    limit_insertion_search: bool = False
+    """是否用图先验 + 预算限制插入搜索。默认关闭：实测限制预算虽然更快，但最终分数对
+    插入顺序高度敏感（±3%），保留父类的完整插入搜索能让质量更稳定、可比性更好。"""
     insertion_group_budget: int = 48
     """每轮最多尝试多少个插入组（父类上限是 64，`DIAGNOSTIC_INSERTION_GROUP_LIMIT`）。"""
     insertion_max_passes: int = 4
@@ -133,13 +176,102 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         self._mechanism_cache: dict[tuple[Any, ...], list[tuple[str, ...]]] = {}
         self._embedding_by_name: dict[str, tuple[float, ...]] = {}
         self._graph_room_combos_cache: dict[tuple[Any, ...], tuple[RoomCombo, ...]] = {}
+        self._bond_basis_cache: dict[tuple[Any, ...], BondBasis | None] = {}
+        config = self.graph_config
+        self._cache = GraphModelCache(
+            directory=Path(config.cache_dir) if config.cache_dir else None,
+            enabled=config.use_cache,
+        )
         self.graph_stats: dict[str, Any] = {}
+        # 多起手：同一份模型可以生成多种短名单策略，用**同一目标函数**挑初始排班。
+        self._closure_override: int | None = None
+        self._active_optimize_kwargs: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # 多起手：用同一个目标函数挑初始排班
+    # ------------------------------------------------------------------
+    def _build_shifts(
+        self,
+        layout,
+        room_specs,
+        *,
+        shift_durations=None,
+        shift_count=None,
+        shift_hours=None,
+        shift_times,
+    ):
+        """先各自生成一套初始排班，再按 ``optimize()`` 真正使用的目标函数择优。
+
+        为什么要这么做：短名单策略（是否做羁绊闭包）会让**初始排班**在
+        560.2 / 567.5 这种量级上摆动，而下游插入搜索只能部分补偿。
+        开闭包在「平衡搓玉」上赚 14 分、在「不搓玉」上亏 9 分——符号取决于
+        那次提名是否抢走了别的房间更需要的干员。
+        逐房间贪心本来就没法给「抢走稀缺干员」定价，所以与其赌一个策略，
+        不如两套都生成、用同一个 ``target_selection_score`` 打分选更好的那套。
+        代价只是多几轮 beam 搜索 + 每套一次 ``simulator.evaluate``。
+        """
+        budgets = self.graph_config.initial_starts
+        if len(budgets) <= 1:
+            # 单起手时也要尊重指定的预算，否则 (0,) 会被误当成「用默认值」。
+            self._closure_override = budgets[0] if budgets else None
+            return super()._build_shifts(
+                layout,
+                room_specs,
+                shift_durations=shift_durations,
+                shift_count=shift_count,
+                shift_hours=shift_hours,
+                shift_times=shift_times,
+            )
+
+        best: tuple[float, list, list[str]] | None = None
+        for budget in budgets:
+            self._closure_override = budget
+            self._graph_room_combos_cache.clear()
+            shifts, warnings = super()._build_shifts(
+                layout,
+                room_specs,
+                shift_durations=shift_durations,
+                shift_count=shift_count,
+                shift_hours=shift_hours,
+                shift_times=shift_times,
+            )
+            score = self._start_score(shifts)
+            if best is None or score > best[0]:
+                best = (score, shifts, warnings)
+        self._closure_override = None
+        assert best is not None
+        self.graph_stats.setdefault("starts", {})
+        self.graph_stats["starts"]["budgets"] = list(budgets)
+        return best[1], best[2]
+
+    def _start_score(self, shifts) -> float:
+        """用 ``optimize()`` 实际排序用的目标给候选初始排班打分。"""
+        kwargs = self._active_optimize_kwargs
+        simulator = ProductionSimulator(
+            self.game_data,
+            shard_formula=self.shard_formula,
+            drone_policy=kwargs.get("drone_policy", "none"),
+            calibration_profile="guide",
+            reference_expected_daily=kwargs.get("drone_reference_daily"),
+            pure_gold_target=kwargs.get("pure_gold_target", DEFAULT_PURE_GOLD_TARGET_PER_DAY),
+            pure_gold_tolerance=kwargs.get("pure_gold_tolerance", DEFAULT_PURE_GOLD_TOLERANCE),
+        )
+        report = simulator.evaluate(shifts)
+        mode = normalize_mode(kwargs.get("mode", "normal"))
+        return target_selection_score(
+            mode,
+            report,
+            min_lmd_gross=kwargs.get("min_lmd_gross", 0.0),
+            min_exp=kwargs.get("min_exp", 0.0),
+            min_orundum=kwargs.get("min_orundum", 0.0),
+        )
 
     # ------------------------------------------------------------------
     # 对外契约：标上自己的模型版本号
     # ------------------------------------------------------------------
     def optimize(self, layout, **kwargs):
         """继承父类的全部流程，只把审计里的模型版本号换成图优化器的。"""
+        self._active_optimize_kwargs = dict(kwargs)
         result = super().optimize(layout, **kwargs)
         insertion_search = result.diagnostic_insertion_search
         if isinstance(insertion_search, dict):
@@ -333,6 +465,34 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
             room_level=spec.room_level,
             slots=spec.slots if spec.slots is not None else spec.capacity,
         )
+        bond_basis = self._bond_basis(spec, duration_hours, variants)
+
+        cache_key = self._cache.key(
+            {
+                "kind": "room_value_model",
+                "graph": self.graph().meta.get("signature"),
+                "query": query.to_dict(),
+                "capacity": spec.capacity,
+                "samples": config.fit_samples,
+                "ridge": config.ridge,
+                "seed": config.seed,
+                "bonds": None if bond_basis is None else bond_basis.to_dict(),
+                "hiddenDim": config.hidden_dim,
+                "layers": config.layers,
+                "featureVersion": FEATURE_VERSION,
+            }
+        )
+        cached = self._cache.load(cache_key)
+        if cached and cached.get("model"):
+            try:
+                model = RoomValueModel.from_dict(cached["model"])
+                self._models[key] = model
+                self._record_runtime_count("graphModel.cacheHit")
+                self._store_model_stats(spec, model)
+                return model
+            except (KeyError, TypeError, ValueError):
+                pass
+        self._record_runtime_count("graphModel.cacheMiss")
 
         def oracle(names: tuple[str, ...]) -> float:
             operators = [variants[name] for name in names if name in variants]
@@ -351,15 +511,45 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
             seed=config.seed,
             ridge=config.ridge,
             min_combo_size=1,
+            bond_basis=bond_basis,
+            bond_ridge_scale=config.bond_ridge_scale,
         )
         if model is not None and model.training.get("samples", 0) < config.min_fit_samples:
             model = None
         self._models[key] = model
-        self.graph_stats.setdefault("models", {})
-        self.graph_stats["models"][f"{spec.room_type}:{spec.target}:{spec.room_level}:{spec.slots}"] = (
-            None if model is None else model.describe()
-        )
+        self._store_model_stats(spec, model)
+        if model is not None:
+            self._cache.save(cache_key, {"model": model.to_dict()})
         return model
+
+    def _store_model_stats(self, spec: RoomSpec, model: RoomValueModel | None) -> None:
+        self.graph_stats.setdefault("models", {})
+        self.graph_stats["models"][
+            f"{spec.room_type}:{spec.target}:{spec.room_level}:{spec.slots}"
+        ] = None if model is None else model.describe()
+
+    def _bond_basis(
+        self,
+        spec: RoomSpec,
+        duration_hours: float,
+        variants: dict[str, BaseSkill] | None = None,
+    ) -> BondBasis | None:
+        """显式羁绊基：阵营人数与点名羁绊指示函数。"""
+        if not self.graph_config.use_bonds:
+            return None
+        key = (*self._pool_key(spec, duration_hours), "bonds")
+        if key in self._bond_basis_cache:
+            return self._bond_basis_cache[key]
+        names = variants if variants is not None else self._best_variant_map(spec, duration_hours)
+        basis = build_bond_basis(
+            self.graph(),
+            room_type=spec.room_type,
+            candidate_names=list(names),
+            target=spec.target,
+            max_tags=self.graph_config.bond_max_tags,
+        )
+        self._bond_basis_cache[key] = basis
+        return basis
 
     # ------------------------------------------------------------------
     # 候选池：用图上的羁绊边做闭包
@@ -494,6 +684,7 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         variants = self._best_variant_map(spec, duration_hours)
         variant_options = self._variant_options(spec, duration_hours)
         known_names = set(variants)
+        candidates_names = [candidate.skill.operator_name for candidate in candidates]
         names: list[str] = []
         seen_names: set[str] = set()
         for candidate in candidates:
@@ -505,6 +696,11 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         if not names:
             self._graph_room_combos_cache[cache_key] = ()
             return []
+
+        # 池内下标：父类同分时的先后顺序就是它。
+        rank_of_name: dict[str, int] = {}
+        for index, name in enumerate(candidates_names):
+            rank_of_name.setdefault(name, index)
 
         unary_cache = self._unary_cache.setdefault(self._pool_key(spec, duration_hours), {})
         pair_cache = self._pair_cache.setdefault(self._pool_key(spec, duration_hours), {})
@@ -522,36 +718,53 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         shortlisted = [combo_names for _predicted, combo_names in ranked]
         name_set = set(names)
         graph = self.graph()
-        # 羁绊闭包 + 覆盖保障：对每个候选干员，沿 ``named`` 边把“必须同房才生效”的
-        # 伙伴直接拼进一个组合，再用一元预测最强的干员补满。
-        # 旧优化器要靠全量枚举“碰巧”撞上「相伴 + 能天使」这类联动，
-        # 这里用图上的边定向提名，同时保证候选池里每个干员至少进入一个送审组合。
         covered: set[str] = set()
         for combo in shortlisted:
             covered.update(combo)
+        # 羁绊闭包：只针对「在池子里真有 named 伙伴」的干员，沿边把必须同房才生效的
+        # 伙伴拼成一个组合，再用一元预测最强的干员补满。
+        # 旧优化器要靠全量枚举“碰巧”撞上「相伴 + 能天使」这类联动，这里定向提名。
+        closure_budget = (
+            self.graph_config.bond_closure_budget
+            if self._closure_override is None
+            else self._closure_override
+        )
+        for name in names:
+            if closure_budget <= 0:
+                break
+            partners = [
+                partner
+                for partner, _weight in graph.neighbors(name, "named")
+                if partner in name_set and partner != name
+            ]
+            if not partners:
+                continue
+            combo_tuple = self._assemble_combo(
+                [name, *partners[: max(0, spec.capacity - 1)]],
+                names,
+                unary_cache,
+                spec.capacity,
+            )
+            if combo_tuple is None:
+                continue
+            closure_budget -= 1
+            covered.update(combo_tuple)
+            if combo_tuple not in shortlisted:
+                shortlisted.append(combo_tuple)
+        # 覆盖保障：让池子里每个干员至少进入一个送审组合。
+        # 默认关闭——实测它会把一批低一元分的干员强行塞进短名单，打乱同分组合的先后，
+        # 在 243/不搓玉 上要了 9 分（−11.55 → −2.39）。需要绝对安全时再打开。
         coverage_budget = self.graph_config.coverage_extra
         for name in names:
             if coverage_budget <= 0:
                 break
             if name in covered:
                 continue
-            partners = [
-                partner
-                for partner, _weight in graph.neighbors(name, "named")
-                if partner in name_set and partner != name
-            ]
-            chosen = [name, *partners[: max(0, spec.capacity - 1)]]
-            if len(chosen) < spec.capacity:
-                fill_order = sorted(
-                    (other for other in names if other not in chosen),
-                    key=lambda other: (-unary_cache.get(other, 0.0), other),
-                )
-                chosen.extend(fill_order[: spec.capacity - len(chosen)])
-            combo_tuple = tuple(sorted(chosen))
-            if len(combo_tuple) != spec.capacity:
+            combo_tuple = self._assemble_combo([name], names, unary_cache, spec.capacity)
+            if combo_tuple is None:
                 continue
-            covered.update(combo_tuple)
             coverage_budget -= 1
+            covered.update(combo_tuple)
             if combo_tuple not in shortlisted:
                 shortlisted.append(combo_tuple)
         # 机制超边：guide 刊例表里“必须同时上场才触发”的干员集合。
@@ -564,6 +777,21 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
             if mechanism not in shortlisted:
                 shortlisted.append(mechanism)
             added_mechanisms += 1
+        # 平手兜底：父类是「先 combinations(pool, k) 再稳定排序」，所以同分组合中
+        # 它优先看到的是**枚举顺序最靠前**的那批。而合成玉/赤金/经验这些房间经常大片同分
+        # （例：L3 合成玉贸易室 4750 个组合全是 282.0），谁进前 64 完全由这个顺序决定。
+        # 短名单只覆盖了父类枚举空间的一小部分，同分先后就会和父类不一致，
+        # 进而把下游 beam/插入搜索带到另一条支路。这里补枚举前缀让同分区间对齐。
+        prefix_budget = self.graph_config.lexicographic_prefix
+        if prefix_budget > 0 and len(names) >= spec.capacity:
+            ordered_names = sorted(names, key=lambda name: rank_of_name.get(name, 1 << 30))
+            for combo in _combinations(ordered_names, spec.capacity):
+                if prefix_budget <= 0:
+                    break
+                prefix_budget -= 1
+                combo_tuple = tuple(sorted(combo))
+                if combo_tuple not in shortlisted:
+                    shortlisted.append(combo_tuple)
 
         self._record_runtime_count("graphShortlist.count", len(shortlisted))
         self._record_runtime_count("graphShortlist.mechanismCandidates", added_mechanisms)
@@ -586,6 +814,16 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
             score = self._score_room_combo(spec, operators, duration_hours)
             combos.append(RoomCombo(operators=tuple(operators), score=score))
         self._record_runtime_count("graphShortlist.exactEvaluations", len(combos))
+        # 同分组合的先后顺序会一路放大到最终排班（例如 L3 合成玉贸易站几乎全是 282.0，
+        # 谁进这三格纯看排序）。父类的顺序是「按池下标字典序」——因为它是先
+        # ``combinations(pool, k)`` 再稳定排序。这里用同样的平手规则，
+        # 让短名单在分数相同的组合上与父类保持一致，避免下游搜索走到完全不同的支路。
+        rank_of = {name: index for index, name in enumerate(candidates_names)}
+        combos.sort(
+            key=lambda combo: tuple(
+                sorted(rank_of.get(skill.operator_name, len(rank_of)) for skill in combo.operators)
+            )
+        )
         combos.sort(
             key=lambda combo: (
                 combo.score,
@@ -599,6 +837,27 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         )
         self._graph_room_combos_cache[cache_key] = tuple(combos)
         return combos
+
+    def _assemble_combo(
+        self,
+        pinned: Sequence[str],
+        names: Sequence[str],
+        unary_cache: dict[str, float],
+        capacity: int,
+    ) -> tuple[str, ...] | None:
+        """把 ``pinned`` 里的干员固定下来，再用一元预测最强的干员补满到 ``capacity``。"""
+        chosen = list(dict.fromkeys(pinned))
+        if len(chosen) > capacity:
+            return None
+        if len(chosen) < capacity:
+            fill_order = sorted(
+                (other for other in names if other not in chosen),
+                key=lambda other: (-unary_cache.get(other, 0.0), other),
+            )
+            chosen.extend(fill_order[: capacity - len(chosen)])
+        if len(chosen) != capacity:
+            return None
+        return tuple(sorted(chosen))
 
     def _mechanism_combos(
         self,
@@ -619,6 +878,30 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         capacity = max(1, spec.capacity)
         variants = self._best_variant_map(spec, duration_hours)
         unary_cache = self._unary_cache.setdefault(self._pool_key(spec, duration_hours), {})
+        cache_key = self._cache.key(
+            {
+                "kind": "mechanism_combos",
+                "graph": self.graph().meta.get("signature"),
+                "roomType": spec.room_type,
+                "target": spec.target,
+                "level": spec.room_level,
+                "slots": spec.slots,
+                "capacity": capacity,
+                "duration": round(float(duration_hours), 6),
+                "partnerPool": self.graph_config.mechanism_partner_pool,
+                "keep": self.graph_config.mechanism_keep,
+                "variants": sorted(
+                    f"{name}:{skill.buff_id}" for name, skill in variants.items()
+                ),
+                "featureVersion": FEATURE_VERSION,
+            }
+        )
+        stored = self._cache.load(cache_key)
+        if stored and stored.get("combos") is not None:
+            result = [tuple(combo) for combo in stored["combos"]]
+            self._mechanism_cache[key] = result
+            self._record_runtime_count("graphMechanism.cacheHit")
+            return result
         ordered_by_unary = sorted(
             variants, key=lambda name: (-unary_cache.get(name, 0.0), name)
         )
@@ -644,6 +927,8 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         scored.sort(key=lambda item: (-item[0], item[1]))
         result = [combo for _score, combo in scored[: self.graph_config.mechanism_keep]]
         self._mechanism_cache[key] = result
+        self._record_runtime_count("graphMechanism.cacheMiss")
+        self._cache.save(cache_key, {"combos": [list(combo) for combo in result]})
         return result
 
     def _mechanism_required_sets(self, spec: RoomSpec) -> list[tuple[str, ...]]:
@@ -995,7 +1280,9 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
     def _runtime_profile(self) -> dict[str, Any]:
         profile = super()._runtime_profile()
         if self.graph_stats:
-            profile["graph"] = self.graph_stats
+            profile["graph"] = {**self.graph_stats, "cache": self._cache.profile()}
+        elif self._cache.active:
+            profile["graph"] = {"cache": self._cache.profile()}
         return profile
 
     def candidate_pool_audit(self, shifts) -> dict[str, Any]:

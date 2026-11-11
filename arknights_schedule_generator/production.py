@@ -61,6 +61,38 @@ DEFAULT_PURE_GOLD_TARGET_PER_DAY = -2.0
 DEFAULT_PURE_GOLD_TOLERANCE = 0.5
 DEFAULT_MAX_DRONE_CYCLE_REPEATS = 7
 
+# ---- 社区口径的房型增益权重（以 1% 干员增益为单位，贸易站 = 1） ---------------
+#
+# 社区常用换算：1% 贸易站 = 1% 制造站，2% 发电站 = 1% 贸易站，
+# 12% 会客室 = 1% 贸易站，1% 办公室 = 2% 贸易站。
+# 反向读最容易记住：数值越大表示「越少百分比就顶得上 1% 贸易站」。
+ROOM_EFFICIENCY_WEIGHTS: dict[str, float] = {
+    "TRADING": 1.0,
+    "MANUFACTURE": 1.0,
+    "POWER": 0.5,
+    "MEETING": 1.0 / 12.0,
+    "HIRE": 2.0,
+}
+
+# 只把「价值没有被资源流分项覆盖」的房型单列成 ``roomEfficiency``：
+# 贸易/制造已经由 lmdGross / exp / orundum 计价；发电站的无人机收益只覆盖了它
+# 真实价值的一小部分，会客室（线索/信用）与办公室（人脉）则完全没有资源项。
+ROOM_EFFICIENCY_SCORED_ROOM_TYPES: tuple[str, ...] = ("POWER", "MEETING", "HIRE")
+
+# 把「1% 干员增益 × 1 天」折算成总分的锚点，锚在贸易站上，使权重表自洽：
+#   L3 龙门币订单 E[lmd]=1450、E[秒]=12204
+#   ⇒ 每日 lmdGross ≈ 86400/12204 × 1450 = 10266 × 倍率
+#   ⇒ +1%（倍率 +0.01）= +102.66 LMD/天
+#   分数里 lmdGross 按 /1000 × 1.5 计 ⇒ 0.154 分
+# 这个数只从既有常量推导，不引入新的“魔法数字”。
+TRADE_EQUIVALENT_PERCENT_SCORE = (
+    86400.0 / 12204.0 * 1450.0 * 0.01 * (1.5 / 1000.0)
+)
+# 房间级选人目标用的同一锚点，但按 ``room_output_score`` 的贸易系数 0.0036 折算。
+TRADE_EQUIVALENT_PERCENT_ROOM_SCORE = (
+    86400.0 / 12204.0 * 1450.0 * 0.01 * 0.0036
+)
+
 GUIDE_LMD_TRADE_LOOKUPS = (
     {
         "id": "shamare_tequila_butushu_l3",
@@ -375,6 +407,12 @@ class ProductionVector:
     droneTargets: list[dict[str, Any]] = field(default_factory=list)
     cycleHours: float = 24.0
     dailyScale: float = 1.0
+    roomSpeedDays: dict[str, float] = field(default_factory=dict)
+    """各房型「干员增益百分比 × 天数」的累加（不含每槽 1% 的基础值）。
+
+    用于按社区口径把发电/会客/办公室的干员增益折算成贸易等价分；
+    刻意只统计**干员提供**的部分，因为换算表说的是「百分比为干员增益」。
+    """
 
     def add(self, other: "ProductionVector") -> None:
         self.lmdGross += other.lmdGross
@@ -401,6 +439,8 @@ class ProductionVector:
             self.droneTarget = dict(other.droneTarget)
         if other.droneTargets:
             self.droneTargets.extend(dict(target) for target in other.droneTargets)
+        for room_type, value in other.roomSpeedDays.items():
+            self.roomSpeedDays[room_type] = self.roomSpeedDays.get(room_type, 0.0) + value
 
     def scale(self, factor: float) -> None:
         self.lmdGross *= factor
@@ -419,6 +459,8 @@ class ProductionVector:
             self.droneContribution[key] *= factor
         self.droneCount *= factor
         self.droneUsed *= factor
+        for room_type in list(self.roomSpeedDays):
+            self.roomSpeedDays[room_type] *= factor
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -443,6 +485,9 @@ class ProductionVector:
             "droneTargets": self.droneTargets,
             "cycleHours": round(self.cycleHours, 3),
             "dailyScale": round(self.dailyScale, 6),
+            "roomSpeedDays": {
+                key: round(value, 3) for key, value in sorted(self.roomSpeedDays.items())
+            },
         }
 
 
@@ -600,6 +645,8 @@ class ProductionReport:
     calibrationProfile: str = "guide"
     sourceAssumptions: list[str] = field(default_factory=list)
     guideComparison: dict[str, Any] | None = None
+    roomEfficiencyDetail: dict[str, float] = field(default_factory=dict)
+    """各房型换算成贸易等价分之后的分项（含未计入总分的贸易/制造，用于对照）。"""
 
     @property
     def score(self) -> float:
@@ -616,6 +663,10 @@ class ProductionReport:
             "calibrationProfile": self.calibrationProfile,
             "sourceAssumptions": self.sourceAssumptions,
             "guideComparison": self.guideComparison,
+            "roomEfficiencyDetail": {
+                key: round(value, 4)
+                for key, value in sorted(self.roomEfficiencyDetail.items())
+            },
         }
 
 
@@ -695,6 +746,7 @@ class ProductionSimulator:
             skillEffectAudit=dedupe_skill_effect_audit(skill_effect_audit),
             calibrationProfile=self.calibration_profile,
             sourceAssumptions=self.source_assumptions(),
+            roomEfficiencyDetail=room_efficiency_detail(daily),
         )
 
     def evaluate_room(
@@ -721,24 +773,34 @@ class ProductionSimulator:
                 effect.unsupported.extend(control_effect.unsupported)
                 effect.skill_effect_audit.extend(control_effect.control_audit)
         if room.room_type == "MANUFACTURE":
-            return self.evaluate_manufacture(
+            production = self.evaluate_manufacture(
                 room, duration_hours, effect, ignore_capacity=ignore_capacity
             )
-        if room.room_type == "TRADING":
-            return self.evaluate_trading(room, duration_hours, effect, ignore_capacity=ignore_capacity)
-        if room.room_type == "HIRE":
-            return self.evaluate_office(room, duration_hours, effect)
-        if room.room_type == "MEETING":
-            return self.evaluate_meeting(room, duration_hours, effect)
-        fatigue = ProductionVector(fatigueRisk=fatigue_risk(room, duration_hours, effect))
-        return RoomProduction(
-            roomId=room.room_id,
-            roomType=room.room_type,
-            target=room.target,
-            vector=fatigue,
-            effect=effect,
-            roomLevel=room.room_level,
-        )
+        elif room.room_type == "TRADING":
+            production = self.evaluate_trading(
+                room, duration_hours, effect, ignore_capacity=ignore_capacity
+            )
+        elif room.room_type == "HIRE":
+            production = self.evaluate_office(room, duration_hours, effect)
+        elif room.room_type == "MEETING":
+            production = self.evaluate_meeting(room, duration_hours, effect)
+        else:
+            fatigue = ProductionVector(fatigueRisk=fatigue_risk(room, duration_hours, effect))
+            production = RoomProduction(
+                roomId=room.room_id,
+                roomType=room.room_type,
+                target=room.target,
+                vector=fatigue,
+                effect=effect,
+                roomLevel=room.room_level,
+            )
+        # 只记录「干员增益」的部分（不含每槽 1% 基础值），供社区口径的效率分使用。
+        if effect.speed_percent:
+            production.vector.roomSpeedDays[room.room_type] = (
+                production.vector.roomSpeedDays.get(room.room_type, 0.0)
+                + float(effect.speed_percent) * duration_hours / 24.0
+            )
+        return production
 
     def evaluate_manufacture(
         self,
@@ -2668,6 +2730,30 @@ def dedupe_skill_effect_audit(items: list[dict[str, Any]]) -> list[dict[str, Any
     return result
 
 
+def room_efficiency_detail(vector: ProductionVector) -> dict[str, float]:
+    """按社区权重把各房型「干员增益」折算成贸易等价分。
+
+    只有 :data:`ROOM_EFFICIENCY_SCORED_ROOM_TYPES` 会被计入总分，
+    但这里把五类都算出来，方便在报告里对照：
+
+    * 贸易/制造：资源流分项已经计价，这里只作为「等价性检查」展示；
+    * 发电/会客/办公室：这条明细是它们的**唯一**分值来源。
+    """
+    detail: dict[str, float] = {}
+    for room_type, weight in ROOM_EFFICIENCY_WEIGHTS.items():
+        speed_days = vector.roomSpeedDays.get(room_type, 0.0)
+        if not speed_days:
+            continue
+        detail[room_type] = speed_days * weight * TRADE_EQUIVALENT_PERCENT_SCORE
+    return detail
+
+
+def room_efficiency_score(vector: ProductionVector) -> float:
+    """计入综合分的那部分（发电 + 会客 + 办公室）。"""
+    detail = room_efficiency_detail(vector)
+    return sum(detail.get(room_type, 0.0) for room_type in ROOM_EFFICIENCY_SCORED_ROOM_TYPES)
+
+
 def score_breakdown_for(vector: ProductionVector) -> dict[str, float]:
     lmd_net_score = 0.0 if vector.orundum > 0.001 else vector.lmdNet / 1000.0 * 6.0
     return {
@@ -2683,6 +2769,10 @@ def score_breakdown_for(vector: ProductionVector) -> dict[str, float]:
         else 0.0,
         "overflowPenalty": -vector.overflowLoss * 5.0,
         "fatiguePenalty": -vector.fatigueRisk * 2.0,
+        # 社区口径的房型增益分（贸易=1 单位）：2% 发电 ≡ 1% 贸易、
+        # 12% 会客 ≡ 1% 贸易、1% 办公室 ≡ 2% 贸易。与上面的资源流分项
+        # 是两种不同口径，刻意并列展示而不是互相覆盖。
+        "roomEfficiency": room_efficiency_score(vector),
     }
 
 

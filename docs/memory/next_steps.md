@@ -842,3 +842,82 @@ Known constraints and next steps:
   guarantee on partial rosters.
 - `tests/test_graph_optimizer.py` covers graph building, encoder determinism, the closed-form solver,
   readout fit quality, optimizer contract, and real-data shortlist recall.
+
+
+## P6 - Community Room-Efficiency Weights, Explicit Bonds, numpy + Cache
+
+Status: implemented, benchmarked, not yet committed.
+
+Scoring model:
+- Added `roomEfficiency` to `scoreBreakdown`: operator-buff percentages converted to
+  trade-equivalent units. Weights (TRADING = 1): MANUFACTURE 1.0, POWER 0.5,
+  MEETING 1/12, HIRE 2.0. Read as "2% POWER / 12% MEETING / 0.5% HIRE == 1% TRADING".
+- Anchor is derived, not hardcoded: `TRADE_EQUIVALENT_PERCENT_SCORE` = 86400/12204*1450*0.01*1.5/1000
+  ~= 0.154 points per percent-day. Room-level objective uses the same table with the 0.0036 anchor.
+- Only POWER/MEETING/HIRE enter the total (TRADING/MANUFACTURE are already priced by the resource
+  lines and appear in `roomEfficiencyDetail` for comparison only). The legacy `office`/`meeting`
+  lines are kept untouched for calibration comparability.
+- Measured on 243 balanced: `roomEfficiency` 19.31 (POWER 4.81 / MEETING 0.64 / HIRE 13.86).
+  Versus old weights: meeting down 2.6x, office up 9x, power newly positive.
+
+Explicit bond basis (`graph_bonds.py`):
+- Faction-count and named-bond indicator columns added to the readout, fitted by the same ridge solve.
+- Must be gated per (room_type, target): BLACKSTEEL/RHINE use base-wide counts, `op` uses power-room
+  counts, so a room-level unary column for them is pure noise (measured: manufacture holdout R2 0.75 -> 0.70).
+- Alias tags (rhine/rh, blacksteel/bs, knight/kazimierz) are deduplicated by member set to avoid
+  perfect collinearity; the bond block gets 4x stronger shrinkage via column scaling.
+- TRADING/O_GOLD holdout: R2 0.8206 -> 0.8649, MAE 2.382 -> 1.997, Spearman 0.907 -> 0.950.
+
+numpy + persistence:
+- `numpy` is an optional import (no new dependency). Encoder has a dense-matrix path that is
+  numerically identical to the pure-Python sparse path (< 1e-17); ridge uses `np.linalg.solve`.
+- `graph_cache.py` persists fitted readouts and mechanism hyperedges under
+  `outputs/graph_model_cache/`, keyed by graph signature + spec + fit params + bond basis +
+  `FEATURE_VERSION`. Degrades silently when the directory is not writable.
+
+Findings that constrain future tuning:
+- The insertion-search budget is fast but the final score is chaotic w.r.t. insertion order
+  (measured +-3% across otherwise-equal configs), so `limit_insertion_search` defaults to False.
+- Tied exact scores dominate several rooms (L3 Orundum trading: 4750 combos all 282.0). The
+  `lexicographic_prefix` knob re-adds the parent's enumeration prefix so tie ordering matches;
+  this raised shortlist top-16 recall from 0.71 to 1.0.
+- More fit samples is NOT better for the final schedule: 288 -> 1536 lifts holdout R2 0.82 -> 0.89
+  but costs ~4% final score, because a sharper model narrows the shortlist and the downstream
+  beam search loses diversity. Default stays 288.
+
+Open items:
+- Office/meeting room selection still ranks by parsed `score_skill`, not by the weighted room score,
+  and ignores `control_hire_spd` from the control room. Next step if the office is revisited.
+- Dormitory rest and mood state are still not modeled (Fiammetta's `患难之交` mood swap is a no-op).
+
+
+## P7 - Multi-start Initial Assignment (why the 4th case regressed)
+
+Observation: the graph optimizer scored 3W/0L/1T in the first 4-case run, then 3W/1L after the
+explicit-bond round. The single swing case is 243 / normal / 2x12 (no orundum).
+
+Ablation on that case (all other knobs held):
+- Explicit bond features: no effect (-11.549 either way).
+- Lexicographic prefix 0 / 96 / 512: no effect (597.4 ~ 598.5).
+- Insertion-search budget on/off: no effect on score (only accepted-insertion count).
+- Coverage guarantee (`coverage_extra` 24 -> 0): -11.549 -> -2.389. This was the biggest knob,
+  but it is confounded with the bond closure (same loop at the time).
+
+Root cause (measured, not hypothesised): the bond-closure nomination makes the **initial**
+assignment worse in that scenario (560.2 vs 567.5 on a 610-scale objective), because a per-room
+greedy cannot price "this combo burns an operator another room needs more". The very same switch is
+worth +14 points on 243 / balanced-orundum, so the sign depends on the case and no fixed value wins.
+
+Fix: `GraphOptimizerConfig.initial_starts` (default `(12, 0)`). Build one initial assignment per
+shortlist policy and pick with `target_selection_score` -- the same objective `optimize()` already
+uses to choose target options, so no new heuristic is introduced. Measured cost: 15.7s vs 16.0s on
+that case (the extra beam pass and one `simulator.evaluate` are noise next to the insertion search).
+
+Effect: 243/normal -1.89% -> -0.39%; full 4-case mean ratio 1.0116 -> 1.0139, simulator calls
+0.787x -> 0.757x, wall 0.98x -> 0.851x.
+
+Remaining known defect, deliberately not fixed yet:
+- The beam still has no explicit opportunity-cost / scarcity term for operators that several rooms
+  want. A graph-native fix would be a decode-time penalty proportional to each operator's demand
+  across the layout's other production rooms (`λ * demand_i` added to the unary adjust). That needs
+  tuning and validation, and the residual gap on 243/normal is already only 0.4%.

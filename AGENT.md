@@ -140,6 +140,12 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
 - 紫色加号是资源特定的额外加速参考值，不属于基础 `dailyExpected`，也不能把 EXP/LMD/赤金三个紫色加号同时相加。
 - 绿色 `0.843/0.792` 是排班侧指标，不是 LMD、EXP、赤金或合成玉收益字段。
 - `drone-policy none` 是基础产能口径；需要看无人机收益时单独跑 `lmd-trade`、`gold-factory`、`exp-factory` 或 `auto`。
+- `scoreBreakdown` 里新增的 `roomEfficiency` 是**社区口径的房型增益分**，与资源流分项并列但口径不同：
+  以 1% 干员增益为单位，贸易站=1、制造站=1、发电站=0.5（2%≡1% 贸易）、会客室=1/12（12%≡1% 贸易）、
+  办公室=2（1%≡2% 贸易）。只有发电/会客/办公室进总分（贸易/制造已由资源项计价，只作对照）。
+  换算锚点从既有常量推导（`TRADE_EQUIVALENT_PERCENT_SCORE ≈ 0.154` 分/%），不要改成魔法数字。
+- 会客室/办公室的旧明细 `meeting`(`meetingSpeed/30`) 与 `office`(`officeSpeed/30`) **保留不动**，
+  用于和既有校准口径对比；不要用它们代替 `roomEfficiency` 做跨房型比较。
 
 ## 最近用户样例结论
 

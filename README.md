@@ -114,6 +114,10 @@ python -m arknights_schedule_generator recommend `
 两者共用同一套收益口径（`ProductionSimulator`）、同一套班次/宿舍/循环边界约束和同一份导出契约，
 所以结果可以直接对比。
 
+综合分 = **资源流分项**（LMD / EXP / 合成玉 / 赤金与碎片平衡）
+加 **`roomEfficiency`**（社区口径的房型增益分，以 1% 干员增益为单位：
+1% 贸易 = 1% 制造、2% 发电 ≡ 1% 贸易、12% 会客 ≡ 1% 贸易、1% 办公室 ≡ 2% 贸易）。
+
 ```powershell
 # 用图卷积优化器生成
 python -m arknights_schedule_generator generate `

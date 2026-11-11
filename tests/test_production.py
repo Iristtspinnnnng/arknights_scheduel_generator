@@ -33,6 +33,8 @@ from arknights_schedule_generator.optimizer import (
 from arknights_schedule_generator.power import apply_right_side_preset, power_status
 from arknights_schedule_generator.presets import preset_contract
 from arknights_schedule_generator.production import (
+    ROOM_EFFICIENCY_WEIGHTS,
+    TRADE_EQUIVALENT_PERCENT_SCORE,
     GUIDE_MANUFACTURE_LOOKUPS,
     GUIDE_LMD_TRADE_LOOKUPS,
     ProductionReport,
@@ -336,8 +338,81 @@ class ProductionModelTest(unittest.TestCase):
 
         self.assertAlmostEqual(report.dailyExpected.officeSpeed, 30.5)
         self.assertAlmostEqual(report.scoreBreakdown["office"], 30.5 / 30.0)
-        self.assertAlmostEqual(report.score, round(30.5 / 30.0, 3))
+        # 社区口径：1% 办公室 = 2% 贸易站。这里干员给了 +60%，12h 班次
+        # ⇒ 30 个「百分比·天」⇒ 30 × 2.0 × 贸易锚点 分。
+        expected_efficiency = 30.0 * ROOM_EFFICIENCY_WEIGHTS["HIRE"] * TRADE_EQUIVALENT_PERCENT_SCORE
+        self.assertAlmostEqual(report.scoreBreakdown["roomEfficiency"], expected_efficiency)
+        self.assertAlmostEqual(
+            report.scoreBreakdown["roomEfficiency"],
+            report.roomEfficiencyDetail["HIRE"],
+        )
+        self.assertAlmostEqual(
+            report.score,
+            round(30.5 / 30.0 + expected_efficiency, 3),
+        )
         self.assertEqual(report.roomReports[0]["stationSlots"], 1)
+
+    def test_room_efficiency_weights_match_community_equivalences(self) -> None:
+        """社区口径：1% 贸易 = 1% 制造 = 2% 发电 = 12% 会客 = 0.5% 办公室。
+
+        也就是「等效 1% 贸易站」所需的百分比 → 权重取倒数。
+        """
+        self.assertEqual(ROOM_EFFICIENCY_WEIGHTS["TRADING"], 1.0)
+        self.assertEqual(ROOM_EFFICIENCY_WEIGHTS["MANUFACTURE"], 1.0)
+        self.assertAlmostEqual(ROOM_EFFICIENCY_WEIGHTS["POWER"], 1.0 / 2.0)
+        self.assertAlmostEqual(ROOM_EFFICIENCY_WEIGHTS["MEETING"], 1.0 / 12.0)
+        self.assertAlmostEqual(ROOM_EFFICIENCY_WEIGHTS["HIRE"], 1.0 / 0.5)
+        # 1% 办公室 = 2% 贸易站；12% 会客室 = 1% 贸易站
+        self.assertAlmostEqual(
+            ROOM_EFFICIENCY_WEIGHTS["HIRE"] / ROOM_EFFICIENCY_WEIGHTS["TRADING"], 2.0
+        )
+        self.assertAlmostEqual(
+            ROOM_EFFICIENCY_WEIGHTS["MEETING"] * 12.0,
+            ROOM_EFFICIENCY_WEIGHTS["TRADING"],
+        )
+        self.assertAlmostEqual(
+            ROOM_EFFICIENCY_WEIGHTS["POWER"] * 2.0,
+            ROOM_EFFICIENCY_WEIGHTS["TRADING"],
+        )
+
+    def test_room_efficiency_is_trade_equivalent_in_score_and_detail(self) -> None:
+        """同一个班次里放满五种房间，验证折算比例真的按权重表落地。"""
+        with TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_data(data_dir)
+            game_data = GameData.load(data_dir)
+            simulator = ProductionSimulator(game_data)
+            rooms = [
+                RoomAssignment("trading_1", "TRADING", "O_GOLD", None, [
+                    skill("贸易干员", "TRADING", "订单", "进驻贸易站时，订单获取效率+20%", 20)
+                ], 0, room_level=3, slots=1),
+                RoomAssignment("manufacture_1", "MANUFACTURE", "F_EXP", None, [
+                    skill("制造干员", "MANUFACTURE", "生产", "进驻制造站时，生产力+20%", 20)
+                ], 0, room_level=3, slots=1),
+                RoomAssignment("power_1", "POWER", None, None, [
+                    skill("发电干员", "POWER", "能源", "进驻发电站时，无人机充能速度+20%", 20)
+                ], 0, room_level=3, slots=1),
+                RoomAssignment("meeting_1", "MEETING", None, None, [
+                    skill("会客干员", "MEETING", "线索", "进驻会客室时，线索搜集速度+20%", 20)
+                ], 0, room_level=3, slots=1),
+                RoomAssignment("hire_1", "HIRE", None, None, [
+                    skill("办公干员", "HIRE", "人脉", "进驻办公室时，人脉资源联络速度+20%", 20)
+                ], 0, room_level=3, slots=1),
+            ]
+            report = simulator.evaluate([ShiftPlan("A", "00:00", 24, rooms, [])])
+
+        detail = report.roomEfficiencyDetail
+        base = detail["TRADING"]
+        self.assertGreater(base, 0.0)
+        self.assertAlmostEqual(detail["MANUFACTURE"], base)
+        self.assertAlmostEqual(detail["POWER"], base / 2.0)
+        self.assertAlmostEqual(detail["MEETING"], base / 12.0)
+        self.assertAlmostEqual(detail["HIRE"], base * 2.0)
+        # 只有发电/会客/办公室计入总分那条明细
+        self.assertAlmostEqual(
+            report.scoreBreakdown["roomEfficiency"],
+            detail["POWER"] + detail["MEETING"] + detail["HIRE"],
+        )
 
     def test_control_meeting_link_contributes_to_meeting_speed_and_score(self) -> None:
         with TemporaryDirectory() as temp_dir:
