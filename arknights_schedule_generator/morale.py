@@ -188,6 +188,8 @@ def audit_morale_cycle(layout: Layout, shifts: list[ShiftPlan]) -> dict[str, Any
             "Each operator stationed in the control centre lowers every on-duty operator's "
             "morale consumption by 0.05 per hour (control-centre staff included).",
             "Parsed self, single-target, and room-wide recovery bonuses are counted; other bonuses are excluded.",
+            "A single-target recovery skill follows the lowest-morale roommate until it is full, "
+            "then moves on; its owner is never the target.",
             "A cycle is sustainable when every operator's potential recovery covers its consumption.",
             "Recovery booked while an operator is already at 24 morale is counted as potential recovery only.",
             "Reported minimum and ending morale come from one cycle that starts at 24 morale for everyone.",
@@ -451,28 +453,102 @@ def _simulate_cycle(
                 if room_index < len(layout.dormitory_levels)
                 else 5
             )
-            all_bonus, self_bonuses, single_bonus = dormitory_recovery_bonuses(room)
-            single_target = dormitory_single_recovery_target(room, morale, single_bonus)
             passive = dormitory_passive_recovery_rate(room_level) + dormitory_boost
-            for skill in room.operators:
-                name = skill.operator_name
-                recovery_rate = (
-                    passive
-                    + all_bonus
-                    + self_bonuses.get(name, 0.0)
-                    + (single_bonus if name == single_target else 0.0)
-                )
-                potential = recovery_rate * hours
-                current = morale.get(name, MAX_MORALE)
-                updated = min(MAX_MORALE, current + potential)
-                morale[name] = updated
-                trace.recovery[name] = trace.recovery.get(name, 0.0) + potential
-                trace.applied_recovery[name] = (
-                    trace.applied_recovery.get(name, 0.0) + (updated - current)
-                )
+            _recover_dormitory_room(room, passive, morale, hours, trace)
         for name, value in morale.items():
             minimum[name] = min(minimum.get(name, value), value)
     return trace
+
+
+def _recover_dormitory_room(
+    room: Any,
+    passive: float,
+    morale: dict[str, float],
+    hours: float,
+    trace: _CycleTrace,
+) -> None:
+    """Replay one dormitory stay, including the sticky single-target recovery skill.
+
+    ``除自身以外心情未满的某个干员每小时恢复+N`` picks the lowest-morale roommate
+    as it is and holds it until that operator is full (then the next lowest takes
+    over); the skill owner can never be the target. Everything is simulated as a
+    sequence of constant-rate segments so the "until full" rule is exact.
+    """
+    all_bonus, self_bonuses, single = dormitory_recovery_bonuses(room)
+    occupants = [skill.operator_name for skill in room.operators]
+    base_rates = {
+        name: passive + all_bonus + self_bonuses.get(name, 0.0) for name in occupants
+    }
+    single_bonus, owner = single if single is not None else (0.0, None)
+    candidates = [name for name in occupants if name != owner]
+
+    remaining = float(hours)
+    while remaining > 1e-9 and single_bonus > 0.0 and candidates:
+        target = _lowest_unfilled(candidates, morale)
+        if target is None:
+            break
+        rate = base_rates[target] + single_bonus
+        headroom = MAX_MORALE - morale[target]
+        segment = remaining if rate <= 0.0 else min(remaining, headroom / rate)
+        _advance_dormitory_occupants(
+            occupants,
+            base_rates,
+            morale,
+            trace,
+            segment,
+            target=target,
+            bonus=single_bonus,
+        )
+        remaining -= segment
+        candidates.remove(target)
+    if remaining > 1e-9:
+        _advance_dormitory_occupants(
+            occupants,
+            base_rates,
+            morale,
+            trace,
+            remaining,
+            target=None,
+            bonus=0.0,
+        )
+
+
+def _lowest_unfilled(candidates: list[str], morale: dict[str, float]) -> str | None:
+    unfilled = [
+        name
+        for name in candidates
+        if morale.get(name, MAX_MORALE) < MAX_MORALE - MORALE_STATE_TOLERANCE
+    ]
+    if not unfilled:
+        return None
+    return min(
+        unfilled,
+        key=lambda name: (morale.get(name, MAX_MORALE), candidates.index(name)),
+    )
+
+
+def _advance_dormitory_occupants(
+    occupants: list[str],
+    base_rates: dict[str, float],
+    morale: dict[str, float],
+    trace: _CycleTrace,
+    hours: float,
+    *,
+    target: str | None,
+    bonus: float,
+) -> None:
+    if hours <= 0.0:
+        return
+    for name in occupants:
+        rate = base_rates[name] + (bonus if name == target else 0.0)
+        potential = rate * hours
+        current = morale.get(name, MAX_MORALE)
+        updated = min(MAX_MORALE, current + potential)
+        morale[name] = updated
+        trace.recovery[name] = trace.recovery.get(name, 0.0) + potential
+        trace.applied_recovery[name] = (
+            trace.applied_recovery.get(name, 0.0) + (updated - current)
+        )
 
 
 def _steady_state(
@@ -529,9 +605,16 @@ def dormitory_passive_recovery_rate(room_level: int) -> float:
     )
 
 
-def dormitory_recovery_bonuses(room: Any) -> tuple[float, dict[str, float], float]:
+def dormitory_recovery_bonuses(
+    room: Any,
+) -> tuple[float, dict[str, float], tuple[float, str] | None]:
+    """Parse one dormitory room's recovery skills.
+
+    Returns ``(all_bonus, self_bonuses, single)`` where ``single`` is the strongest
+    ``除自身以外心情未满的某个干员每小时恢复+N`` effect as ``(bonus, owner_name)``.
+    """
     all_bonus = 0.0
-    single_bonus = 0.0
+    single: tuple[float, str] | None = None
     self_bonuses: dict[str, float] = {}
     for skill in room.operators:
         description = re.sub(r"<[^>]+>", "", skill.description)
@@ -548,23 +631,14 @@ def dormitory_recovery_bonuses(room: Any) -> tuple[float, dict[str, float], floa
         if self_matches:
             self_bonuses[skill.operator_name] = max(float(value) for value in self_matches)
         single_matches = re.findall(
-            r"(?:某一名|前一位).*?心情每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
+            r"(?:某一名|某个|前一位).{0,12}?每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
             description,
         )
         if single_matches:
-            single_bonus = max(single_bonus, *(float(value) for value in single_matches))
-    return all_bonus, self_bonuses, single_bonus
-
-
-def dormitory_single_recovery_target(
-    room: Any,
-    morale: dict[str, float],
-    single_bonus: float,
-) -> str | None:
-    if single_bonus <= 0.0:
-        return None
-    candidates = [skill.operator_name for skill in room.operators]
-    return min(candidates, key=lambda name: morale.get(name, MAX_MORALE), default=None)
+            bonus = max(float(value) for value in single_matches)
+            if single is None or bonus > single[0]:
+                single = (bonus, skill.operator_name)
+    return all_bonus, self_bonuses, single
 
 
 def _failed_audit(

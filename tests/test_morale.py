@@ -449,6 +449,107 @@ class MoraleModelEffectsTest(unittest.TestCase):
             12.0 * 2.05,
         )
 
+    def test_single_target_recovery_goes_to_the_lowest_morale_roommate(self) -> None:
+        """「除自身以外心情未满的某个干员」: the buff follows the lowest-morale roommate."""
+        audit = audit_morale_cycle(
+            entry_level_dormitory_layout(),
+            [
+                # 低心情 works 12h (24 -> 12) while the others stay full.
+                shift("A", "08:00", 12.0, working=["低心情"]),
+                # 2h dormitory shift: 医者 (the skill owner) + two roommates.
+                shift(
+                    "B",
+                    "20:00",
+                    2.0,
+                    resting=["医者", "低心情", "高心情"],
+                    descriptions={
+                        "医者": "进驻宿舍时，使该宿舍内除自身以外心情未满的某个干员"
+                        "每小时恢复+0.55（同种效果取最高）",
+                    },
+                ),
+            ],
+        )
+
+        ledger = audit["moraleLedgerByOperator"]
+        # 低心情 is the only roommate below full: 2.0 + 0.55 per hour for 2h.
+        self.assertAlmostEqual(ledger["低心情"]["recovery"], 2.0 * 2.55)
+        # Full roommates and the skill owner only get the passive rate.
+        self.assertAlmostEqual(ledger["高心情"]["recovery"], 2.0 * 2.0)
+        self.assertAlmostEqual(ledger["医者"]["recovery"], 2.0 * 2.0)
+
+    def test_single_target_recovery_never_targets_its_own_owner(self) -> None:
+        audit = audit_morale_cycle(
+            entry_level_dormitory_layout(),
+            [
+                shift("A", "08:00", 12.0, working=["医者"]),
+                # The owner is the only operator below full: nobody else can take it.
+                shift(
+                    "B",
+                    "20:00",
+                    2.0,
+                    resting=["医者", "高心情"],
+                    descriptions={
+                        "医者": "进驻宿舍时，使该宿舍内除自身以外心情未满的某个干员"
+                        "每小时恢复+0.55（同种效果取最高）",
+                    },
+                ),
+            ],
+        )
+
+        ledger = audit["moraleLedgerByOperator"]
+        self.assertAlmostEqual(ledger["医者"]["recovery"], 2.0 * 2.0)
+        self.assertAlmostEqual(ledger["高心情"]["recovery"], 2.0 * 2.0)
+
+    def test_single_target_recovery_moves_on_once_the_target_is_full(self) -> None:
+        """The buff lasts until the target is full, then it moves to the next roommate."""
+        audit = audit_morale_cycle(
+            entry_level_dormitory_layout(),
+            [
+                # 低心情 burns 1.7/h (24 -> 3.6), 次低 burns 1.5/h (24 -> 6.0).
+                shift(
+                    "A",
+                    "08:00",
+                    12.0,
+                    working=["低心情", "次低"],
+                    descriptions={
+                        "低心情": "心情每小时消耗+0.7",
+                        "次低": "心情每小时消耗+0.5",
+                    },
+                ),
+                shift(
+                    "B",
+                    "20:00",
+                    12.0,
+                    resting=["医者", "低心情", "次低"],
+                    descriptions={
+                        "医者": "进驻宿舍时，使该宿舍内除自身以外心情未满的某个干员"
+                        "每小时恢复+0.55（同种效果取最高）",
+                    },
+                ),
+            ],
+        )
+
+        passive = 2.0
+        bonus = 0.55
+        # 低心情 starts at 3.6 and saturates after 8h at 2.55/h.
+        first_segment = (24.0 - 3.6) / (passive + bonus)
+        self.assertAlmostEqual(first_segment, 8.0)
+        # 次低 recovers passively meanwhile, then takes over for the remaining time.
+        second_start = 6.0 + passive * first_segment
+        second_segment = (24.0 - second_start) / (passive + bonus)
+
+        ledger = audit["moraleLedgerByOperator"]
+        self.assertAlmostEqual(
+            ledger["低心情"]["recovery"], passive * 12.0 + bonus * first_segment, places=5
+        )
+        self.assertAlmostEqual(
+            ledger["次低"]["recovery"], passive * 12.0 + bonus * second_segment, places=5
+        )
+        self.assertGreater(second_segment, 0.0)
+        self.assertAlmostEqual(ledger["医者"]["recovery"], passive * 12.0)
+        self.assertAlmostEqual(audit["endingMoraleByOperator"]["低心情"], 24.0)
+        self.assertAlmostEqual(audit["endingMoraleByOperator"]["次低"], 24.0)
+
     def test_unattributable_morale_clauses_are_reported_not_dropped(self) -> None:
         audit = audit_morale_cycle(
             dormitory_layout(levels=(1, 1, 1, 1)),

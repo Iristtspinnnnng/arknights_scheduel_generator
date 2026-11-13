@@ -1090,3 +1090,29 @@ already had; `tests/test_production.py::test_pure_gold_repeats_never_exceed_the_
 covers it. End-to-end `generate` for 252 (hybrid) and 342 (graph) now both succeed, cycleHours 48,
 worst balance +7.2.
 
+
+## P12 - Single-Target Dormitory Recovery (Sticky, Per User Observation)
+
+Status: done. `dorm_rec_single` was parsed as 0 rows before this change (the regex only knew
+`某一名|前一位`); real data uses "除自身以外心情未满的**某个**干员每小时恢复+N". With `某个` added,
+26 real buffs now parse, worth +0.20 .. +0.75 morale per hour.
+
+Semantics were supplied by the user from in-game observation (this is not a per-tick minimum):
+- on entering the dormitory the buff lands on the roommate with the **lowest current morale**
+  (`除自身以外`, so the skill owner is never a candidate);
+- it stays latched on that operator until it is **full** or **leaves**; once full, the same rule
+  hands it to the next-lowest still-unfilled roommate;
+- if nobody in the dormitory is recovering (everybody full), the buff waits for the first roommate
+  to enter below full.
+
+Implementation: `dormitory_recovery_bonuses` returns `(all_bonus, self_bonuses, (bonus, owner))`,
+and `_recover_dormitory_room` replays the dormitory stay as a sequence of constant-rate segments
+(`min(remaining, headroom / rate)`), so "until full" is exact rather than iterated. Potential recovery
+in the ledger only counts the segments where the bonus was actually active, which is what the tests pin
+down. 3 new tests: lowest-morale target, owner never targeted, hand-off after saturation.
+
+Effect on the feasibility scan: none. All 16 layout/mode/shift combinations still pass with identical
+scores and identical worst balances - the dormitory helpers do not enter the production score, so this
+only makes the morale ledger more honest. Remaining known gap: `患难之交` (心情交换) is still unmodelled,
+and `dorm_rec_all&tired` / `&unfull` conditional extra bonuses are ignored (they only add recovery).
+
