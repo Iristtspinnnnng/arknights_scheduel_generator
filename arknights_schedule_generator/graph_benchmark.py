@@ -69,8 +69,10 @@ class BenchmarkCase:
 
 
 # 注意：自 v0.1.1 起 `optimizer.optimize()` 会做心情周期硬门槛校验
-# （`morale.audit_morale_cycle`），不满足就抛 ValueError。5 制造站的布局（252/342）
-# 在满练表上凑不出可持续轮换，两套算法都会失败，所以默认场景只用 243 / 333。
+# （`morale.audit_morale_cycle`），不满足就抛 ValueError。历史上 5 制造站的布局
+# （252/342）在满练表上凑不出可持续轮换，所以默认场景只用 243 / 333；心情模型补上
+# 宿舍绿字（氛围）与控制中枢全局减耗之后 252/342 已可行（见
+# `docs/handoff_graph_optimizer.md` §4），默认场景保持不变只是为了让历史基准可比。
 DEFAULT_BENCHMARK_CASES: tuple[BenchmarkCase, ...] = (
     BenchmarkCase("243-balanced-2x12", "243", "balanced-orundum", 2, 12, "none"),
     BenchmarkCase("243-normal-2x12", "243", "normal", 2, 12, "none"),

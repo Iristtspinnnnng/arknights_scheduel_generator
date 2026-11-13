@@ -60,13 +60,12 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
 
 - 涉及图卷积优化器、心情门槛、宿舍建模的工作，先读 `docs/handoff_graph_optimizer.md`。
   里面有：现状、已做过的实验（别重复）、心情/宿舍的正确公式与数据来源、
-  上游 `morale.py` 的 4 处偏差、修正顺序、以及工作区未提交改动清单。
-
-## 接手入口（图卷积 / 心情模型）
-
-- 涉及图卷积优化器、心情门槛、宿舍建模的工作，先读 `docs/handoff_graph_optimizer.md`。
-  里面有：现状、已做过的实验（别重复）、心情/宿舍的正确公式与数据来源、
-  上游 `morale.py` 的 4 处偏差、修正顺序、以及工作区未提交改动清单。
+  `morale.py` 的收支记账判据与已修的偏差、修正顺序、以及工作区未提交改动清单。
+- 心情模型的当前口径（2026-11）：判据是「每个干员一个周期的收支记账」
+  （`moraleLedgerByOperator`），不是「周期末心情 ≥ 周期初心情」；宿舍恢复 = 白字
+  （1.6~2.0/h）+ 绿字（`0.0004 × 氛围`，满氛围 L5 再 +2.0/h）+ 技能；控制中枢每名在岗干员
+  让所有在岗干员消耗 −0.05/h；无法归属的技能条款列在 `unmodelledMoraleEffects` 里而不是静默计 0。
+  细节和实测见 handoff 的 §2 与 §4。
 
 ## 当前可信状态
 
@@ -141,8 +140,9 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
 ```
 
 - `benchmark` 默认跑 4 个场景、每场景两套算法，耗时数分钟；用 `--cases` 只跑子集
-  （`243-balanced-2x12` / `243-normal-2x12` / `252-balanced-3x8-auto` / `342-max-3x8-auto`），
+  （`243-balanced-2x12` / `243-normal-2x12` / `333-balanced-3x8-auto` / `333-max-2x12-auto`），
   或用 `--layouts/--modes/--shift-patterns/--drone-policies` 自定义组合。
+  （252/342 在心情模型补上宿舍绿字与控制中枢减耗之后已经可行，只是默认基准保持历史四个场景可比。）
 - 新旧算法都能用 `--optimizer hybrid|graph` 切换（`generate` 和 `recommend` 都支持）。
 
 ## 关键口径
@@ -158,6 +158,10 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
   换算锚点从既有常量推导（`TRADE_EQUIVALENT_PERCENT_SCORE ≈ 0.154` 分/%），不要改成魔法数字。
 - 会客室/办公室的旧明细 `meeting`(`meetingSpeed/30`) 与 `office`(`officeSpeed/30`) **保留不动**，
   用于和既有校准口径对比；不要用它们代替 `roomEfficiency` 做跨房型比较。
+- 心情模型口径（`morale.py`）：宿舍恢复 = 白字 `1.5+0.1×等级` + 绿字 `0.0004×氛围`（满氛围按
+  `min(5000, 1000×等级)` 计）+ 技能；在岗消耗 = 1/h + 自身/房间/中枢/全基建技能修正，`max(0, ·)`；
+  控制中枢每名在岗干员让**所有在岗**干员消耗 −0.05/h（`controlData.basicCostBuff = -5`）；
+  周期可持续 ⟺ 每人一周期 `潜在恢复 − 消耗 ≥ 0`。别再写回「末值 vs 初值」的判定。
 
 ## 最近用户样例结论
 

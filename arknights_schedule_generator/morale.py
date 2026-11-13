@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import Layout, ShiftPlan
-from .skill_rules import fatigue_delta_from_text
 
 
 MAX_MORALE = 24.0
@@ -18,7 +17,17 @@ MORALE_BALANCE_TOLERANCE = 0.0001
 #: Bound for the (diagnostic only) steady-state replay.
 MAX_STEADY_STATE_ITERATIONS = 16
 
-AUDIT_VERSION = 2
+#: building_data.comfortLimit.
+DORMITORY_COMFORT_LIMIT = 5000.0
+#: building_data.dormData.phases[].decorationLimit (1000 per level up to 5000).
+DORMITORY_COMFORT_PER_LEVEL = 1000.0
+#: Green text: building_data.comfortManpowerRecoverFactor is 25, i.e. comfort / (25 * 100).
+#: Full comfort at level 5 is 5000 points, worth 2.0 morale per hour (0 -> 24 in 6h).
+COMFORT_RECOVERY_PER_POINT = 0.0004
+#: building_data.controlData.basicCostBuff is -5 (1/100 units) per stationed operator.
+CONTROL_MORALE_RELIEF_PER_OPERATOR = 0.05
+
+AUDIT_VERSION = 3
 
 
 def active_operator_names(shift: ShiftPlan) -> set[str]:
@@ -169,15 +178,193 @@ def audit_morale_cycle(layout: Layout, shifts: list[ShiftPlan]) -> dict[str, Any
         "failureReasons": failure_reasons,
         "transitions": transitions,
         "steadyState": _steady_state(layout, shifts, start_morale),
+        "unmodelledMoraleEffects": _collect_unmodelled_morale_effects(shifts),
         "assumptions": [
-            "Working operators consume one morale per hour plus parsed positive skill consumption.",
+            "On-duty consumption is 1 morale per hour, adjusted by self, room-wide, "
+            "control-centre and base-wide morale skills, and floored at 0.",
             "Dormitory recovery uses the game-data level base rate (1.6 through 2.0 morale per hour).",
+            "Dormitory recovery adds 0.0004 morale per comfort point.",
+            "Full dormitory comfort is assumed: 1000 points per level, capped at 5000.",
+            "Each operator stationed in the control centre lowers every on-duty operator's "
+            "morale consumption by 0.05 per hour (control-centre staff included).",
             "Parsed self, single-target, and room-wide recovery bonuses are counted; other bonuses are excluded.",
             "A cycle is sustainable when every operator's potential recovery covers its consumption.",
             "Recovery booked while an operator is already at 24 morale is counted as potential recovery only.",
             "Reported minimum and ending morale come from one cycle that starts at 24 morale for everyone.",
+            "Morale clauses the model cannot attribute are listed in unmodelledMoraleEffects and not credited.",
         ],
     }
+
+
+@dataclass(frozen=True)
+class MoraleEffects:
+    """Scope-attributed morale effects parsed out of one on-duty skill description.
+
+    Every value is a **consumption delta**: recovery is booked as negative
+    consumption, so ``-0.25`` means "this skill saves 0.25 morale per hour".
+    """
+
+    #: Applies to the skill owner only.
+    self_delta: float = 0.0
+    #: Applies to everybody stationed in the skill owner's room (same-effect max).
+    room_delta: float = 0.0
+    #: Applies to every operator in the control centre (control-scoped skills stack).
+    control_delta: float = 0.0
+    #: Applies to the other control-centre operators, never to the owner.
+    control_others_delta: float = 0.0
+    #: Applies to every on-duty operator outside the control centre.
+    other_facilities_delta: float = 0.0
+    #: Applies to the whole base.
+    global_delta: float = 0.0
+    #: Extra recovery for every dormitory occupant (recovery, not a consumption cut).
+    all_dormitories_recovery: float = 0.0
+    #: Clauses the model cannot attribute; reported instead of being silently dropped.
+    unmodelled: tuple[str, ...] = ()
+
+
+_CLAUSE_SPLIT = re.compile(r"[，；。]")
+_SENTENCE_SPLIT = re.compile(r"[；。]")
+_MORALE_CLAUSE = re.compile(r"心情每小时(消耗|恢复)(?:速度)?([+-])(\d+(?:\.\d+)?)")
+_FACILITY_WORDS = ("贸易站", "制造站", "发电站", "会客室", "办公室", "训练室", "加工站")
+_CONDITIONAL_PARTNER = re.compile(r"当与([^，；。]{1,12}?)(?:一起|进驻)")
+#: Clauses that are scoped by a counted/targeted group instead of by facility.
+_COUNTED_GROUP_MARKERS = ("每个", "每名", "每有", "每人")
+
+
+def parse_morale_effects(
+    description: str,
+    room_names: frozenset[str] | set[str] | tuple[str, ...] = (),
+) -> MoraleEffects:
+    """Attribute the ``心情每小时消耗/恢复`` clauses of an on-duty skill.
+
+    Scopes are read from the clause itself (``自身`` / ``当前制造站内`` /
+    ``控制中枢内`` / ``基建内`` / ``其他设施内`` / ``所有宿舍内``), because the same
+    number means different things depending on the words around it. Dormitory-room
+    clauses are left to :func:`dormitory_recovery_bonuses`. Anything the parser
+    cannot attribute safely -- counted faction bonuses, class-restricted dormitory
+    recovery, named operators, ``部分设施``, an unmet ``当与`` partner -- is returned
+    in ``unmodelled`` instead of being credited to the wrong scope.
+    """
+    text = re.sub(r"<[^>]+>", "", description)
+    if "心情每小时" not in text:
+        return MoraleEffects()
+
+    names = set(room_names)
+    values: dict[str, float] = {}
+    unmodelled: list[str] = []
+    for sentence in _SENTENCE_SPLIT.split(text):
+        pending_condition = False
+        for clause in _CLAUSE_SPLIT.split(sentence):
+            clause = clause.strip()
+            if not clause:
+                continue
+            is_condition = "当与" in clause
+            if is_condition:
+                conditional = _CONDITIONAL_PARTNER.search(clause)
+                unmet = bool(conditional) and conditional.group(1).strip() not in names
+            else:
+                unmet = pending_condition
+            # A "当与 X" partner condition binds the very next clause only.
+            pending_condition = is_condition and unmet
+            if "心情每小时" not in clause:
+                continue
+            if unmet:
+                unmodelled.append(clause)
+                continue
+            matches = list(_MORALE_CLAUSE.finditer(clause))
+            if not matches:
+                unmodelled.append(clause)
+                continue
+            for match in matches:
+                action, sign, amount = match.groups()
+                value = float(amount) if sign == "+" else -float(amount)
+                consumption_delta = value if action == "消耗" else -value
+                channel = _morale_clause_scope(clause, match.start())
+                if channel is None:
+                    unmodelled.append(clause)
+                    continue
+                if channel == "dormitory":
+                    # Modelled by ``dormitory_recovery_bonuses`` for dormitory rooms.
+                    continue
+                if channel == "all_dormitories" and consumption_delta > 0:
+                    # A dormitory-wide consumption *penalty* has no game equivalent we model.
+                    unmodelled.append(clause)
+                    continue
+                values[channel] = values.get(channel, 0.0) + (
+                    -consumption_delta if channel == "all_dormitories" else consumption_delta
+                )
+    return MoraleEffects(
+        self_delta=values.get("self", 0.0),
+        room_delta=values.get("room", 0.0),
+        control_delta=values.get("control", 0.0),
+        control_others_delta=values.get("control_others", 0.0),
+        other_facilities_delta=values.get("other_facilities", 0.0),
+        global_delta=values.get("global", 0.0),
+        all_dormitories_recovery=values.get("all_dormitories", 0.0),
+        unmodelled=tuple(unmodelled),
+    )
+
+
+def _morale_clause_scope(clause: str, clause_offset: int) -> str | None:
+    """Return the scope channel of one morale clause, or ``None`` when unattributable."""
+    if any(marker in clause for marker in _COUNTED_GROUP_MARKERS):
+        return None
+    if "部分设施" in clause:
+        return None
+    if "所有宿舍" in clause:
+        if "所有宿舍内所有干员" in clause or "所有宿舍内干员" in clause:
+            return "all_dormitories"
+        return None
+    if "宿舍" in clause:
+        if "该宿舍内" in clause or "本宿舍" in clause or "当前宿舍" in clause:
+            return "dormitory"
+        return None
+    if "控制中枢内" in clause:
+        if "除自身以外" in clause:
+            return "control_others"
+        if "所有干员" in clause or "其余干员" in clause or "全体干员" in clause:
+            return "control"
+        return None
+    if "基建内" in clause:
+        return "global"
+    if "其他设施内" in clause or "该设施内" in clause:
+        return "other_facilities"
+    if any(f"{word}内" in clause for word in _FACILITY_WORDS):
+        return "room"
+    if "全体" in clause:
+        # Bare "全体" right after a station clause refers to that station (see 愿者上钩).
+        return "room"
+    leading = clause[:clause_offset]
+    if "自身" in clause:
+        return "self"
+    if "的" in leading:
+        # "丰川祥子的心情每小时恢复+0.1": a named operator, not the skill owner.
+        return None
+    return "self"
+
+
+def _same_effect_max(values: Any) -> float:
+    """Combine "同种效果取最高" values: the strongest relief, or the strongest penalty."""
+    numbers = [float(value) for value in values if value]
+    if not numbers:
+        return 0.0
+    return min(numbers) if all(value < 0.0 for value in numbers) else max(numbers)
+
+
+def _collect_unmodelled_morale_effects(shifts: list[ShiftPlan]) -> list[str]:
+    seen: set[str] = set()
+    for shift in shifts:
+        room_names = {
+            skill.operator_name
+            for room in shift.rooms
+            for skill in room.operators
+        }
+        for room in list(shift.rooms) + list(shift.dormitories):
+            for skill in room.operators:
+                effects = parse_morale_effects(skill.description, room_names)
+                for clause in effects.unmodelled:
+                    seen.add(f"{skill.operator_name}：{clause}")
+    return sorted(seen)
 
 
 @dataclass
@@ -209,13 +396,55 @@ def _simulate_cycle(
     )
     for shift in shifts:
         hours = float(shift.duration_hours)
+        room_names = {
+            skill.operator_name
+            for room in shift.rooms
+            for skill in room.operators
+        }
+        effects = {
+            room.room_id: [
+                parse_morale_effects(skill.description, room_names)
+                for skill in room.operators
+            ]
+            for room in shift.rooms
+        }
+        control_rooms = [room for room in shift.rooms if room.room_type == "CONTROL"]
+        control_effects = [
+            effect for room in control_rooms for effect in effects[room.room_id]
+        ]
+        control_staff = sum(len(room.operators) for room in control_rooms)
+        control_relief = CONTROL_MORALE_RELIEF_PER_OPERATOR * control_staff
+        control_delta = sum(effect.control_delta for effect in control_effects)
+        control_others_total = sum(effect.control_others_delta for effect in control_effects)
+        global_delta = sum(
+            effect.global_delta for room in shift.rooms for effect in effects[room.room_id]
+        )
+        other_facilities_delta = sum(
+            effect.other_facilities_delta
+            for room in shift.rooms
+            for effect in effects[room.room_id]
+        )
+        dormitory_boost = max(
+            (effect.all_dormitories_recovery for effect in control_effects),
+            default=0.0,
+        )
+
         for room in shift.rooms:
-            for skill in room.operators:
+            room_effects = effects[room.room_id]
+            room_delta = _same_effect_max(effect.room_delta for effect in room_effects)
+            in_control = room.room_type == "CONTROL"
+            for skill, effect in zip(room.operators, room_effects):
                 name = skill.operator_name
-                extra_consumption = max(0.0, fatigue_delta_from_text(skill.description))
-                consumed = (1.0 + extra_consumption) * hours
+                rate = 1.0 + effect.self_delta + room_delta + global_delta
+                if in_control:
+                    rate += control_delta + (control_others_total - effect.control_others_delta)
+                else:
+                    rate += other_facilities_delta
+                rate = max(0.0, rate - control_relief)
+                consumed = rate * hours
                 morale[name] = morale.get(name, MAX_MORALE) - consumed
                 trace.consumption[name] = trace.consumption.get(name, 0.0) + consumed
+
         for room_index, room in enumerate(shift.dormitories):
             room_level = (
                 layout.dormitory_levels[room_index]
@@ -224,10 +453,11 @@ def _simulate_cycle(
             )
             all_bonus, self_bonuses, single_bonus = dormitory_recovery_bonuses(room)
             single_target = dormitory_single_recovery_target(room, morale, single_bonus)
+            passive = dormitory_passive_recovery_rate(room_level) + dormitory_boost
             for skill in room.operators:
                 name = skill.operator_name
                 recovery_rate = (
-                    dormitory_base_recovery_rate(room_level)
+                    passive
                     + all_bonus
                     + self_bonuses.get(name, 0.0)
                     + (single_bonus if name == single_target else 0.0)
@@ -275,7 +505,28 @@ def _steady_state(
 
 
 def dormitory_base_recovery_rate(room_level: int) -> float:
+    """White text: ``manpowerRecover`` / 100, i.e. 1.6 at level 1 through 2.0 at level 5."""
     return 1.5 + 0.1 * min(5, max(1, int(room_level)))
+
+
+def dormitory_comfort(room_level: int) -> float:
+    """Assumed comfort: players keep dormitories fully decorated."""
+    return min(
+        DORMITORY_COMFORT_LIMIT,
+        DORMITORY_COMFORT_PER_LEVEL * min(5, max(1, int(room_level))),
+    )
+
+
+def dormitory_comfort_recovery_rate(room_level: int) -> float:
+    """Green text: ``0.0004`` morale per comfort point (0.4/h at level 1, 2.0/h at level 5)."""
+    return COMFORT_RECOVERY_PER_POINT * dormitory_comfort(room_level)
+
+
+def dormitory_passive_recovery_rate(room_level: int) -> float:
+    """White plus green text, before skill bonuses."""
+    return dormitory_base_recovery_rate(room_level) + dormitory_comfort_recovery_rate(
+        room_level
+    )
 
 
 def dormitory_recovery_bonuses(room: Any) -> tuple[float, dict[str, float], float]:
@@ -346,5 +597,6 @@ def _failed_audit(
             "maxIterations": MAX_STEADY_STATE_ITERATIONS,
             "tolerance": MORALE_STATE_TOLERANCE,
         },
+        "unmodelledMoraleEffects": [],
         "assumptions": [],
     }

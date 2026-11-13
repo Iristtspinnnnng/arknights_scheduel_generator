@@ -1010,7 +1010,7 @@ Step (a) is done, see P10.
 ## P10 - Morale Audit Rewritten as a Per-Operator Balance Sheet
 
 Status: done. `morale.py` audit schema bumped to `version: 2`; `tests/test_morale.py` (11 tests) is
-the new contract. `AGENTS.md`/`docs/handoff_graph_optimizer.md` step 1 is closed.
+the new contract. `AGENT.md` / `docs/handoff_graph_optimizer.md` step 1 is closed.
 
 What changed and why:
 - The verdict is now a closed-form balance sheet per operator over one cycle:
@@ -1039,5 +1039,54 @@ What changed and why:
 Not done yet (unchanged from P9): the dormitory green text (`0.0004 x comfort`) is still missing,
 consumption-reduction skills (`心情每小时消耗-N`) are still clamped away, control-centre global morale
 effects are still unmodelled. Those are step 2 of the handoff and should now be measurable against a
-stable gate.
+stable gate. -> Step 2 landed in P11.
+
+
+## P11 - Morale Model: Comfort Green Text, Scoped Consumption, Control Centre
+
+Status: done. `morale.py` audit schema is `version: 3`; `tests/test_morale.py` now has 19 tests.
+Data sources were re-verified against `data/cache/building_data.json`:
+
+- `comfortLimit = 5000`, `comfortManpowerRecoverFactor = 25` -> green text is `comfort / (25 * 100)`,
+  i.e. `0.0004` per comfort point, so a full level-5 dormitory adds exactly `+2.0/h`.
+  Passive dormitory recovery therefore becomes 2.0 / 2.5 / 3.0 / 3.5 / 4.0 per hour for L1..L5.
+- `controlData.basicCostBuff = -5` (1/100 units) -> every operator stationed in the control centre
+  lowers **all on-duty** operators' consumption by `0.05/h`, control-centre staff included.
+
+What changed:
+- `dormitory_comfort` / `dormitory_comfort_recovery_rate` / `dormitory_passive_recovery_rate` implement
+  white + green text; the full-comfort assumption is written into the audit `assumptions`.
+- `parse_morale_effects` attributes every `心情每小时消耗/恢复` clause **by scope** instead of using the
+  whole-description delta: `self`, `room` (当前制造站内/贸易站内全体), `control`, `control_others`,
+  `other_facilities`, `global`, `all_dormitories`. On-duty rate is `max(0, 1 + delta - relief)`.
+  This was mandatory: once `控制中枢内所有干员的心情每小时恢复+0.05` is credited, reusing the old
+  whole-description delta would double-count it on the skill owner.
+- Control-centre skills stack on top of the base rule (`control_mp_cost[*]` +0.05 recovery,
+  `control_clue_cost[000/010]` +1.5/+0.5 consumption, `control_clue_cost&faction[990]` +0.25 to the
+  other control operators, `control_dorm_rec[*]` +0.05 to every dormitory).
+- 21 real clauses the model cannot attribute safely (counted faction bonuses, named operators,
+  `部分设施`, unmet `当与 X` partners, elite-only dormitory recovery) are listed in
+  `unmodelledMoraleEffects` instead of being credited or silently dropped.
+- Still not modelled: `dorm_rec_single` (`某个干员`, ~10 buffs; the regex only knows `某一名|前一位`).
+
+Measured feasibility scan (maxed 447-row roster, `ScheduleOptimizer`, drone `none`, 2x12 and 3x8,
+normal and balanced-orundum): **16/16 combinations pass**, including 252 and 342 which used to fail
+for every combination. Worst per-cycle balance is +4.0 (252/342 3x8) and +14.0..+30.0 on 243/333.
+243 / 333 scores are unchanged (605.6 / 380.3 / 498.0), so this only relaxed the morale gate;
+it did not touch the production model.
+
+Open follow-ups:
+- Re-run the graph-vs-hybrid benchmark with 252/342 cases (they are now feasible, no comparison exists).
+- `dorm_rec_single` activation (needs "除自身以外心情未满的某个干员" targeting).
+- `_ensure_sustainable_morale_cycle`'s staggering can still produce a group that works six consecutive
+  plans in extreme groupings; no longer a feasibility blocker, but still a potential crash path.
+
+Follow-up bug found while validating the new 5-factory feasibility: `generate` defaults to
+`--drone-policy auto`, and the pure-gold repeat policy in the **parent** `ScheduleOptimizer` did not
+respect `MAX_CYCLE_HOURS`. With 252/342 now passing the gate, the policy could repeat a 48h cycle four
+or more times and the final audit rejected it with `cycle_exceeds_seven_days`. The parent loop now
+stops at the first over-cap repeat (`stoppedByMaxCycleHours`), mirroring the guard the graph optimizer
+already had; `tests/test_production.py::test_pure_gold_repeats_never_exceed_the_seven_day_cycle_cap`
+covers it. End-to-end `generate` for 252 (hybrid) and 342 (graph) now both succeed, cycleHours 48,
+worst balance +7.2.
 

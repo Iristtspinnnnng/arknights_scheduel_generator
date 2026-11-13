@@ -23,6 +23,7 @@ from arknights_schedule_generator.models import (
     ShiftPlan,
     UpgradeRequirement,
 )
+from arknights_schedule_generator.morale import MAX_CYCLE_HOURS
 from arknights_schedule_generator.optimizer import (
     OptimizerResult,
     ScheduleOptimizer,
@@ -680,6 +681,59 @@ class ProductionModelTest(unittest.TestCase):
         self.assertEqual(len(expanded), policy["finalShiftCount"])
         self.assertEqual(policy["status"], "within_tolerance")
         self.assertLessEqual(abs(report.dailyExpected.pureGoldDelta - (-2.0)), 0.5)
+
+    def test_pure_gold_repeats_never_exceed_the_seven_day_cycle_cap(self) -> None:
+        """Repeating the cycle for pure-gold granularity must respect `MAX_CYCLE_HOURS`.
+
+        The morale hard gate rejects any cycle longer than seven days, and `generate`
+        defaults to `--drone-policy auto`, so the repeat policy is the default path
+        into the gate. An unreachable tolerance makes the policy try every repeat
+        count, which is exactly where the cap used to be missing.
+        """
+        with TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_data(data_dir)
+            game_data = GameData.load(data_dir)
+            shifts = [
+                ShiftPlan(
+                    "A",
+                    "08:00",
+                    24,
+                    [
+                        room("trading_1", "TRADING", "O_GOLD"),
+                        room("manufacture_1", "MANUFACTURE", "F_GOLD"),
+                    ],
+                    [],
+                ),
+                ShiftPlan(
+                    "B",
+                    "08:00",
+                    24,
+                    [
+                        room("trading_1", "TRADING", "O_GOLD"),
+                        room("manufacture_1", "MANUFACTURE", "F_GOLD"),
+                    ],
+                    [],
+                ),
+            ]
+            simulator = ProductionSimulator(game_data, drone_policy="auto")
+            current_report = simulator.evaluate(shifts)
+            optimizer = ScheduleOptimizer(game_data, [])
+
+            expanded, _report, policy = optimizer._apply_pure_gold_drone_cycle_repeats(
+                shifts,
+                simulator,
+                current_report=current_report,
+                drone_policy="auto",
+                pure_gold_target=-2.0,
+                pure_gold_tolerance=0.0,
+                max_drone_cycle_repeats=7,
+            )
+
+        cycle_hours = sum(shift.duration_hours for shift in expanded)
+        self.assertLessEqual(cycle_hours, MAX_CYCLE_HOURS + 0.0001)
+        self.assertEqual(policy["stoppedByMaxCycleHours"], 4)
+        self.assertEqual(len(expanded), 2 * policy["repeatCount"])
 
     def test_trade_outputs_use_slot_base_and_interval_capacity(self) -> None:
         with TemporaryDirectory() as temp_dir:

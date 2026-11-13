@@ -1,20 +1,25 @@
 # 接手文档：图卷积优化器 + 心情/宿舍模型
 
 > 写于上下文耗尽前。下一个窗口从这里开始，不必回读聊天记录。
-> 最后更新：第 1 步（修 `morale.audit_morale_cycle` 判定）已完成，回归测试在 `tests/test_morale.py`。
+> 最后更新：第 1 步（修 `morale.audit_morale_cycle` 判定）+ 第 2 步（宿舍绿字、减耗、控制中枢）
+> 都已完成；252/342 已由「全部失败」变成全部可行。回归测试在 `tests/test_morale.py`。
 
 ---
 
 ## 0. 一分钟速览
 
-- 分支 `main`，**领先 `origin/main` 2 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
-  `c2d39ba`（社区打分权重 + 显式羁绊 + numpy + 缓存 + 多起手）。
-- **§3 第 1 步已完成**（修心情判定）：判据改成「每个干员一周期收支记账」，
-  `morale.py` 审计 schema 升到 `version: 2`，新增回归测试 `tests/test_morale.py`（11 个）。
-  细节见 §3 第 1 步与 P10。
+- 分支 `main`，**领先 `origin/main` 3 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
+  `c2d39ba`（社区打分权重 + 显式羁绊 + numpy + 缓存 + 多起手）、
+  `d78daad`（心情审计改成收支记账 + 老的基准容错/循环上限）。
+- **§3 第 1、2 步已完成**：
+  - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 现在是 `version: 3`）；
+  - 宿舍补上绿字（`0.0004 × 氛围`）、在岗减耗按作用域解析、控制中枢 −0.05/h × 在岗人数；
+  - 回归测试 `tests/test_morale.py`（19 个）；
+  - **252/342 现在全部可行**（16/16 组合通过，最差收支 +4.0）。
+  细节见 §2、§3、§4。
 - 另有多个文件未提交（见 §7）。
 - 安全备份分支：`backup/pre-rebase-graph`（rebase 前的原始状态）。
-- 测试：**239 passed / 1 skipped / 1 failed**（含新增的 `tests/test_morale.py` 11 个）。唯一失败是既有环境问题
+- 测试：**248 passed / 1 skipped / 1 failed**（含新增的 `tests/test_morale.py` 19 个、纯赤金 7 天上限 1 个）。唯一失败是既有环境问题
   （`test_calibration_report_examples_pass` 需要仓库外的 `C:\tmp\yituliu_schedule_images_current.js`，
   报 `missing_local_asset`），与本项目改动无关，不要去"修"它。
 - 环境：系统 `python`（WindowsApps，3.13）**没有 pytest**，不能直接跑测试；本轮实际用的是 DSH 自带的
@@ -50,34 +55,49 @@ python -m arknights_schedule_generator generate --roster ... --optimizer graph -
 
 ## 2. 心情/宿舍：正确模型（本轮核心结论）
 
-### 2.1 wiki 公式与数据核对（已全部验证）
+### 2.1 公式与数据核对（已全部验证，且已实现）
 
 宿舍每小时恢复 = **白字 + 绿字 + 干员技能**
 
-| 项 | 公式 | 数据来源 | 验证结果 |
+| 项 | 公式 | 数据来源 | 状态 |
 | --- | --- | --- | --- |
-| 白字 | `1.5 + 0.1 × 宿舍等级` | `dormData.phases[].manpowerRecover` 160~200（÷100） | 与 `morale.dormitory_base_recovery_rate` 一致 ✅ |
-| 绿字 | `0.0004 × 实际氛围 + 技能加成` | `comfortLimit = 5000`；`decorationLimit` 按等级 1000/2000/3000/4000/5000 | **代码完全缺失**，全仓无「氛围」引用 ❌ |
-| 技能 | 自身 `+0.7~+2.0`、所有干员 `+0.05` | `dorm_rec_oneself[*]` 等 | 已有解析 ✅（但见 §2.3 的死代码） |
+| 白字 | `1.5 + 0.1 × 宿舍等级` | `dormData.phases[].manpowerRecover` 160~200（÷100） | `dormitory_base_recovery_rate` ✅ |
+| 绿字 | `0.0004 × 实际氛围` | `comfortLimit = 5000`、`comfortManpowerRecoverFactor = 25`（⇒ 1/(25×100) = 0.0004，满氛围 L5 = +2.0/h）；`decorationLimit` 按等级 1000~5000 | 已实现：`dormitory_comfort` / `dormitory_comfort_recovery_rate` ✅ |
+| 技能 | 自身 `+0.7~+2.0`、所有干员 `+0.05` | `dorm_rec_oneself[*]` / `dorm_rec_all[*]` 等 | `dormitory_recovery_bonuses` ✅（见 §2.2 第 4 条：`dorm_rec_single` 仍未启用） |
+| 中枢 | 每名在岗中枢干员让**所有在岗**干员消耗 −0.05/h；中枢技能再叠加 | `controlData.basicCostBuff = -5`（1/100 单位）；`control_mp_cost[*]` / `control_clue_cost[*]` | 已实现：`CONTROL_MORALE_RELIEF_PER_OPERATOR` + `parse_morale_effects` ✅ |
+| 减耗 | `心情每小时消耗−N` | 47 条 buff（`热情澎湃 −0.52`、`拾荒者/囤积者 −0.25`…） | 已实现：按作用域解析后 `max(0, ·)` ✅ |
 
-L5 + 氛围 5000：白字 2.0 + 绿字 **2.0** = **4.0/h** ⇒ 0→24 恰好 **6 小时**。
-所以「六小时回满」不是经验值，是 wiki 公式的直接推论。加上自身技能后常用值 4.7~6.0/h。
+档位（可用 `python -c "from arknights_schedule_generator.morale import dormitory_passive_recovery_rate as r; print([r(i) for i in range(1, 6)])"` 复算，
+应当是 `[2.0, 2.5, 3.0, 3.5, 4.0]`）：
 
-**氛围取值约定**：玩家通常维持满氛围，所以默认 `comfort = min(comfortLimit, decorationLimit(level))`。
-L5→5000、L1→1000。这个假设要写进报告的 `assumptions`。
+| 宿舍等级 | 白字 | 绿字 | 合计 |
+| --- | --- | --- | --- |
+| L1 | 1.6 | 0.4 | **2.0/h** |
+| L3 | 1.8 | 1.2 | **3.0/h** |
+| L5 | 2.0 | 2.0 | **4.0/h** |
 
-### 2.2 上游门槛的 4 处偏差（已实测，全部偏「更严」）
+L5 + 氛围 5000 ⇒ 0→24 恰好 **6 小时**，这就是「六小时回满」的来源；不靠经验值。
 
-1. **减耗技能被丢弃**：47 条 buff 是「心情每小时消耗**−N**」（`热情澎湃 −0.52`、`拾荒者/囤积者 −0.25`），
-   `_simulate_cycle`（旧名 `_advance_morale`）的 `1.0 + max(0.0, fatigue_delta_from_text(...))` 把负号抹平 → 高估消耗。
-   正确写法：`max(0.0, 1.0 + delta)`（下限 0，但允许低于 1）。
-2. **中枢全局心情效果完全没建模**：79 条相关文本，含 `control_clue_cost[000] 神经质`（中枢内所有干员 +1.5/h）、
-   `至察`（+0.5）、`反抗者`（除自身外 +0.25）、7 条 `control_mp_cost[*]`（中枢内所有干员恢复 +0.05/h）。
-   双向遗漏，需要按「中枢在岗干员集合」做一次聚合，类似 `ControlGlobalEffect` 的做法。
-3. **宿舍只按基率**：见 §2.1，缺绿字 → 0→24 算成 12h。
-4. **单体恢复分支是死代码**：`某一名/前一位…心情每小时恢复+` 在真实数据 **0 命中**，`single_bonus` 恒 0。
+**氛围取值约定**：玩家通常维持满氛围，默认 `comfort = min(comfortLimit, 1000 × level)`。
+这条已经写进审计的 `assumptions`（"Full dormitory comfort is assumed..."）。
 
-### 2.3 为什么我上一轮加了 4.0/h 下限却全线失败（重要，别重复踩）
+### 2.2 上游门槛的 4 处偏差（已全部处理）
+
+1. **减耗技能被丢弃** —— 已修。现在按作用域解析（自身 / 本站全体 / 中枢内 / 其他设施 / 全基建），
+   最后 `max(0, 1 + delta)`；并且会分给同房间的其他人（`manu_cost`、`trade_cost`）。
+2. **中枢全局心情效果没建模** —— 已修。基准规则（−0.05/h × 在岗人数，含中枢自己）+ 中枢技能：
+   `control_mp_cost[*]`（中枢内所有干员恢复 +0.05/h，按人数累加）、
+   `control_clue_cost[000/010]`（中枢内所有干员 +1.5 / +0.5 消耗）、
+   `control_clue_cost&faction[990]`（除自身外的中枢干员 +0.25）、
+   `control_dorm_rec[*]`（所有宿舍内恢复 +0.05）、`control_mp_bd_cost_expand` /
+   `control_mp_expand_double`（其他设施内在岗干员恢复 +0.05/+0.1）。**未建模**：按阵营人数（`control_mp_cost&faction[*]`）、
+   指名干员、`部分设施`、`当与 X` 且 X 不在岗 —— 这些进 `unmodelledMoraleEffects`（真实数据 21 条）。
+3. **宿舍只按基率** —— 已修，见 §2.1 绿字。
+4. **单体恢复分支是死代码** —— **仍未启用**。真实文本是「除自身以外心情未满的**某个**干员每小时恢复
+   +0.55」，现有正则只认 `某一名|前一位`，所以 `dorm_rec_single[*]`（约 10 条）仍计 0。
+   如果要启用，还应把目标限制在「除自身以外、心情未满」的舍友上。这是目前已知最大的一条遗漏。
+
+### 2.3 为什么我上一轮加了 4.0/h 下限却全线失败（历史记录，别重复踩）
 
 - 加「6h 预算 = 4.0/h 下限」后，**原本可行的 243/333 全部变成 `cycle_does_not_restore_initial_morale`**。
 - 只保留「减耗修正」（方向相反、更省心情）**同样全线失败**。
@@ -88,9 +108,11 @@ L5→5000、L1→1000。这个假设要写进报告的 `assumptions`。
 > 映射不是压缩映射，迭代不收敛，`end_deficit` 就会把可行排班判成不达标。
 > 它只报「周期回不到初值」，不告诉你自己没收敛。
 
-**结论：必须先修判定，再改恢复模型。** 这与用户提出的顺序一致。（第 1 步已按此完成，见 §3。）
+**结论：必须先修判定，再改恢复模型。** 这与用户提出的顺序一致。
+**两步都已按此完成**：第 1 步修判定（§3），第 2 步补绿字/减耗/中枢（§3 第 2 步）。
+用新判定重跑同一个 4.0/h 实验会是 *放宽* 而不是失败 —— 这正是当初的坑在判定而不是数值上。
 
-### 2.4 252/342 不可行的真正原因（结构性）
+### 2.4 252/342 曾经不可行：错峰展开 + 数值缺口
 
 `_ensure_sustainable_morale_cycle` 的错峰展开：
 
@@ -98,8 +120,11 @@ L5→5000、L1→1000。这个假设要写进报告的 `assumptions`。
 source_index = ((plan_index + group_count - 1 - group_index) // group_count) % len(shifts)
 ```
 
-以 342 / 3×8 / `group_count=2` 为例，某房间组取到的源班次序列是 `[0, 1, 1, 2, 2, 0]`——
-**连续工作 6 个班次（48h）、零休息计划**。任何恢复率都救不了，必须保证每组每周期至少一个休息计划。
+在 342 / 3×8 / `group_count=2` 这种极端分组下，某房间组取到的源班次序列是 `[0, 1, 1, 2, 2, 0]`——
+**连续工作 6 个班次（48h）、零休息计划**，任何恢复率都救不了。不过实测 2×12 与 3×8 的默认位置
+并没有走到这个极端分组：修完判定后 252/342 只是**数值差一点**（缺口 −0.6 ~ −3.6 心情/周期），
+补上绿字和中枢减耗之后 16 种组合全部可行（§4）。所以「必须保证每组每周期至少一个休息计划」
+仍然值得做（是个潜在崩溃点），但已经不是 5 制造站不可行的原因。
 
 ---
 
@@ -143,19 +168,37 @@ source_index = ((plan_index + group_count - 1 - group_index) // group_count) % l
 - 收不抵支必须报 `morale_balance_deficit`，且 `minimumMorale` 不得跑到一周期之外；
 - 重放不收敛（`steadyState.converged=False`）不得影响判定。
 
-### 第 2 步：补绿字 + 减耗（数值修正）
+### 第 2 步：补绿字 + 减耗（数值修正）——**已完成**
 
 ```python
 # morale.py
 DORMITORY_COMFORT_LIMIT = 5000            # building_data.comfortLimit
-COMFORT_RECOVERY_PER_POINT = 0.0004       # wiki: 0.0004 × 氛围
-def dormitory_comfort(level):             # 默认玩家维持满氛围
-    return min(DORMITORY_COMFORT_LIMIT, 1000 * clamp(level, 1, 5))
+DORMITORY_COMFORT_PER_LEVEL = 1000        # dormData.phases[].decorationLimit
+COMFORT_RECOVERY_PER_POINT = 0.0004       # comfortManpowerRecoverFactor=25 ⇒ 1/(25*100)
+CONTROL_MORALE_RELIEF_PER_OPERATOR = 0.05  # controlData.basicCostBuff = -5（1/100 单位）
 ```
-恢复速率 = 白字 + `0.0004 × comfort` + 技能加成；消耗 = `max(0.0, 1.0 + delta)`。
-菲亚梅塔**按用户要求不管**（`自律` 的「无法获得其他来源」标记可以留一个 TODO 注释）。
 
-预期：243/333 仍然通过且更宽松；252/342 在修完第 3 步后才可能可行。
+已实现的模型（比原计划多了一层「作用域」）：
+
+- 宿舍恢复 = 白字 + `0.0004 × 氛围` + 技能（+ 中枢给的「所有宿舍内」加成）；
+- 在岗消耗 = `1 + 修正`，修正按作用域解析：**自身**（`心情每小时消耗−0.25`）、
+  **本站全体**（`当前制造站内所有干员−0.1`、`贸易站内全体干员−0.1`）、
+  **控制中枢内**（+1.5 线索代价 / −0.05 恢复，按人数累加）、
+  **其他设施内**（`control_mp_bd_cost_expand`）、**全基建**；
+- **控制中枢基准规则**：每名在岗中枢干员让所有在岗干员（含中枢自己）消耗 −0.05/h；
+- 最后 `max(0, ·)`，并把它记进 `moraleLedgerByOperator`，所以可以逐人核对；
+- 归属不明的条款（按阵营人数、指名干员、`部分设施`、`当与 X` 且 X 不在岗、精英限定）进
+  `unmodelledMoraleEffects`，真实数据 21 条。
+
+为什么必须做作用域：`fatigue_delta_from_text` 是把整段文本里的 `心情每小时消耗/恢复` 全部加起来的，
+一旦开始计入「控制中枢内所有干员恢复 +0.05」这类条款，再按整段 delta 计自身就会**重复计算**。
+所以 `parse_morale_effects` 先按分句判作用域，再分派到各通道。
+
+菲亚梅塔仍然**按用户要求不管**（`自律` 的「无法获得其他来源」标记可以留一个 TODO 注释）。
+`dorm_rec_single`（`某个干员`）仍未启用，见 §2.2 第 4 条。
+
+实测（满练表，`ScheduleOptimizer`）：243/252/342/333 × 普通/平衡搓玉 × 2×12/3×8 **16 种组合全部可行**，
+252/342 由「全部失败」变成最差收支 +4.0 ~ +7.2。详见 §4。
 
 ### 第 3 步：修错峰展开（结构）
 
@@ -216,19 +259,24 @@ for raw in ("243", "252", "342", "333"):
 
 本轮结果（rebase 后、修判定前）：**只有 243 与 333 通过**；252/342 全部失败。
 
-修判定后（审计 `version: 2`）用同样口径复测 243 / 252 / 342（平衡搓玉、2×12、满练表）：
+修判定后（审计 `version: 2`，补绿字/中枢之前）：252/342 变成**数值差一点** ——
+只有 `morale_balance_deficit`，缺口每人每周期 −0.6 ~ −3.6 心情，没有触发
+`required_rest_exceeds_dormitory_assignment`。
 
-| 布局 | 结果 | 说明 |
-| --- | --- | --- |
-| 243 | 通过（混合 / 图卷积都通过） | `cycleHours` 48（混合）/ 144（图卷积），最差收支 +1.2 / +3.6 |
-| 252 | 失败 | 只有 `morale_balance_deficit`，缺口每人每周期 −0.6 ~ −3.6 心情 |
-| 342 | 失败 | 同上，缺口 −2.4 ~ −3.6 |
+补完绿字 + 减耗 + 中枢（审计 `version: 3`）后，同一脚本（满练表、普通/平衡搓玉、2×12/3×8）实测：
 
-关键：252 / 342 现在是**数值差一点**，不是旧实现报的「回不到初值」或 −180 那种产物；
-缺口量级（≤3.6/周期）远小于第 2 步「补宿舍绿字」（L5 满氛围 +2.0/h，一个 12h 休息计划多出 24）
-能补回来的量。所以第 2 步很可能直接把 252/342 判成可行 —— 到时要重新跑基准，别再假设
-「5 制造站结构性不可行」。`_ensure_sustainable_morale_cycle` 的错峰展开（§2.4）在这两条路径上
-都给出了休息计划，没有触发 `required_rest_exceeds_dormitory_assignment`。
+| 布局 | 2×12 | 3×8 | 最差收支 | `cycleHours` |
+| --- | --- | --- | --- | --- |
+| 243 | 通过 605.6 / 380.3 | 通过 563.5 / 354.9 | +14.0 | 48 / 72 |
+| 252 | 通过 646.6 / 359.9 | 通过 599.7 / 333.1 | +4.0 | 48 |
+| 342 | 通过 680.8 / 546.6 | 通过 632.4 / 499.0 | +4.0 | 48 |
+| 333 | 通过 696.3 / 544.3 | 通过 641.5 / 498.0 | +20.0 | 48 |
+
+（分数为「普通 / 平衡搓玉」，无人机 none。）243 与 333 的分数与 rebase 后基准一致
+（605.566 / 380.290 / 498.041），说明这次修的只是心情判定，没有动收益口径。
+
+结论：**「5 制造站结构性不可行」作废**。默认基准仍保留 243/333 只为让历史数字可比；
+`graph_benchmark.py` 的注释已同步。
 
 ---
 
@@ -244,6 +292,10 @@ for raw in ("243", "252", "342", "333"):
 333 落后的诊断（已排除）：加宽短名单更差（128 → −30.8，192/beam22 → −35.8）、
 加第三个起手无变化。**推断**：短名单只优化房间产能分，而心情门槛给「宿舍恢复能力」定价，
 混合算法穷举会碰巧选中休息友好的人。**这正好由 §3 第 4 步（宿舍图节点）解决。**
+
+修完第 1、2 步之后 243/333 的分数没有变（605.566 / 380.290 / 498.041 全部复现），
+因为这两步只改心情判定与心情模型；心情更宽松之后 252/342 反而变成新的可选布局，
+图卷积在这些新场景上还没有对照数据 —— 下一次要跑的话建议加 252/342 两个 case。
 
 ---
 
@@ -263,19 +315,23 @@ for raw in ("243", "252", "342", "333"):
 
 ---
 
-## 7. 工作区状态（未提交）
+## 7. 工作区状态（上一轮已提交为 `d78daad`，第 2 步待提交）
+
+第 1 步（`d78daad`）已提交：`morale.py` 收支记账判定 + `tests/test_morale.py` + `optimizer.py` 文案
++ `graph_benchmark.py` 容错 + `docs/*`。
+
+第 2 步（本轮，已提交）：
 
 | 文件 | 改动 |
 | --- | --- |
-| `morale.py` | **第 1 步**：判定改成「每人一周期收支记账」，schema `version: 2`，新增 `moraleLedgerByOperator` / `moraleBalanceDeficitOperators` / `steadyState` |
-| `tests/test_morale.py`（新增） | 心情审计契约测试 11 个（`tests/test_morale.py`） |
-| `optimizer.py` | `_ensure_sustainable_morale_cycle` 的 `ValueError` 文案加了每个问题干员的 `balance=` |
-| `graph_benchmark.py` | 失败场景容错（`failed`/`error` 字段）、默认场景改为 243/333、羁绊系数表 |
-| `graph_optimizer.py` | 纯赤金重复次数显式跳过 `base_hours × repeat > 168h`（否则触发心情门槛崩溃）；`initial_starts` 多起手；覆盖/闭包拆分 |
-| `docs/graph_optimizer.md` | §3 打分模型、§4 numpy/缓存、§5b 排班语义（已按收支记账口径重写） |
-| `docs/memory/next_steps.md` | P6/P7/P8/P9 四段 + P10（第 1 步完成记录） |
-| `AGENT.md` | 「接手入口（图卷积 / 心情模型）」——注意这段**重复了两遍**，下次顺手合并 |
-| `docs/handoff_graph_optimizer.md`（新增） | 本文档 |
+| `morale.py` | 宿舍白字+绿字（`dormitory_comfort*`）、作用域化心情解析（`parse_morale_effects` / `MoraleEffects`）、控制中枢 −0.05/h 基准 + 中枢技能叠加、`unmodelledMoraleEffects`，schema `version: 3` |
+| `tests/test_morale.py` | 19 个契约测试（第 1 步 11 个 + 绿字/减耗/房间减耗/中枢减耗/中枢技能/中枢代价/中枢宿舍加成/未建模上报 8 个） |
+| `graph_benchmark.py` | 只改了「5 制造站不可行」那段注释（默认场景未动） |
+| `optimizer.py` | 纯赤金重复次数在**父类**也遵守 7 天上限（`stoppedByMaxCycleHours`）——252/342 变可行后，`generate` 默认 `--drone-policy auto` 会走到这条路径并把周期拉过 168h；新增回归测试 |
+| `AGENT.md` | 合并重复的「接手入口」段，补心情模型口径与基准 case 列表 |
+| `docs/graph_optimizer.md` | §5b 换班/宿舍/中枢/绿字口径与 252/342 可行性 |
+| `docs/memory/next_steps.md` | P11 |
+| `docs/handoff_graph_optimizer.md` | §0/§2/§3/§4/§5 更新为完成态 |
 
 ---
 
@@ -294,3 +350,12 @@ for raw in ("243", "252", "342", "333"):
   `moraleBalanceDeficitOperators`（每人一周期收支）；`steadyState.converged` 是诊断，不是门槛。
 - 心情审计的 `minimumMorale*` / `endingMoraleByOperator` 来自「全员满心情起步走一个周期」的
   一次重放，所以不可行排班的数字也被一个周期的消耗量界定。别再拿封顶后的状态做报告。
+- **`fatigue_delta_from_text` 不能直接当「自身消耗修正」用**：它把整段描述里的
+  `心情每小时消耗/恢复` 全加在一起，会把「中枢内所有干员恢复+0.05」「该宿舍内所有干员+0.15」
+  算到技能持有者头上（重复计算）。心情审计里必须走 `parse_morale_effects` 的作用域分派；
+  生产侧的 `fatigueRisk` 仍在用旧的整段 delta，改那边要先有分数对照。
+- 新增一类心情条款（新文本模式）时：先在 `data/cache` 里统计命中数和作用域，再改
+  `_morale_clause_scope`，最后**加一条 `tests/test_morale.py` 用例**；归属不明的就留在
+  `unmodelledMoraleEffects`，别瞎猜作用域。
+- 控制中枢的 −0.05/h 是「每个在岗干员」的**基准规则**（`controlData.basicCostBuff`），
+  不是技能；不要把它写成技能解析，否则换了中枢人员就丢。

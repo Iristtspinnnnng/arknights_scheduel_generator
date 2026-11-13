@@ -537,7 +537,14 @@ class ScheduleOptimizer:
         best_repeat = 1
         best_error = pure_gold_balance_error(current_report.dailyExpected.pureGoldDelta, pure_gold_target)
         candidates: list[dict[str, Any]] = []
+        # 心情周期硬门槛要求整个循环不超过 7 天（`morale.MAX_CYCLE_HOURS`）。
+        # 重复是为了让赤金收支更细，但每次重复都会把周期拉长；超限的候选必须挡掉，
+        # 否则最终审计会以 `cycle_exceeds_seven_days` 拒绝整个排班。
+        base_cycle_hours = sum(float(shift.duration_hours) for shift in shifts)
         for repeat_count in range(1, max_repeats + 1):
+            if base_cycle_hours * repeat_count > MAX_CYCLE_HOURS + 1e-6:
+                policy["stoppedByMaxCycleHours"] = repeat_count
+                break
             candidate_shifts = shifts if repeat_count == 1 else repeat_shift_cycle(shifts, repeat_count)
             candidate_report = current_report if repeat_count == 1 else simulator.evaluate(candidate_shifts)
             quality = pure_gold_balance_quality(
