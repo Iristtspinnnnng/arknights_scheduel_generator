@@ -68,11 +68,14 @@ class BenchmarkCase:
         }
 
 
+# 注意：自 v0.1.1 起 `optimizer.optimize()` 会做心情周期硬门槛校验
+# （`morale.audit_morale_cycle`），不满足就抛 ValueError。5 制造站的布局（252/342）
+# 在满练表上凑不出可持续轮换，两套算法都会失败，所以默认场景只用 243 / 333。
 DEFAULT_BENCHMARK_CASES: tuple[BenchmarkCase, ...] = (
     BenchmarkCase("243-balanced-2x12", "243", "balanced-orundum", 2, 12, "none"),
     BenchmarkCase("243-normal-2x12", "243", "normal", 2, 12, "none"),
-    BenchmarkCase("252-balanced-3x8-auto", "252", "balanced-orundum", 3, 8, "auto"),
-    BenchmarkCase("342-max-3x8-auto", "342", "max-orundum", 3, 8, "auto"),
+    BenchmarkCase("333-balanced-3x8-auto", "333", "balanced-orundum", 3, 8, "auto"),
+    BenchmarkCase("333-max-2x12-auto", "333", "max-orundum", 2, 12, "auto"),
 )
 
 _DAILY_KEYS = ("lmdGross", "lmdNet", "exp", "orundum", "pureGoldDelta", "shardDelta")
@@ -175,14 +178,23 @@ def _run_one(
     for _ in range(repetitions):
         optimizer = instance or optimizer_class(game_data, roster, shard_formula="rock")
         started = time.perf_counter()
-        result = optimizer.optimize(
-            layout,
-            mode=case.mode,
-            shift_count=case.shift_count,
-            shift_hours=case.shift_hours,
-            drone_policy=case.drone_policy,
-            profile_runtime=True,
-        )
+        try:
+            result = optimizer.optimize(
+                layout,
+                mode=case.mode,
+                shift_count=case.shift_count,
+                shift_hours=case.shift_hours,
+                drone_policy=case.drone_policy,
+                profile_runtime=True,
+            )
+        except Exception as exc:  # 例如心情周期硬门槛不成立
+            return {
+                "algorithm": optimizer_class.__name__,
+                "failed": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "wallSeconds": round(time.perf_counter() - started, 3),
+                "score": None,
+            }
         elapsed = time.perf_counter() - started
         payload = _result_payload(result, elapsed, optimizer_class.__name__)
         if best is None or payload["wallSeconds"] < best["wallSeconds"]:
@@ -264,10 +276,12 @@ def _attach_comparison(case_payload: dict[str, Any]) -> None:
     runs = case_payload["runs"]
     graph = runs.get("graph")
     hybrid = runs.get("hybrid")
-    if not graph:
+    if not graph or graph.get("failed"):
+        if graph and graph.get("failed"):
+            case_payload["comparison"] = {"failed": True, "error": graph.get("error")}
         return
     comparison: dict[str, Any] = {}
-    if hybrid:
+    if hybrid and not hybrid.get("failed"):
         comparison["scoreDelta"] = round(graph["score"] - hybrid["score"], 3)
         comparison["scoreRatio"] = (
             round(graph["score"] / hybrid["score"], 6) if hybrid["score"] else None
@@ -298,6 +312,9 @@ def _attach_comparison(case_payload: dict[str, Any]) -> None:
         comparison["roomsStrictlyBetter"] = better
         comparison["roomsStrictlyWorse"] = worse
         comparison["roomsCompared"] = len(shared)
+    elif hybrid and hybrid.get("failed"):
+        comparison["hybridFailed"] = True
+        comparison["hybridError"] = hybrid.get("error")
     case_payload["comparison"] = comparison
 
 
@@ -308,8 +325,17 @@ def _summarize(cases: Sequence[dict[str, Any]]) -> dict[str, Any]:
     room_ratios: list[float] = []
     wins = 0
     losses = 0
+    failed_cases: list[dict[str, Any]] = []
     for payload in cases:
         comparison = payload.get("comparison") or {}
+        if comparison.get("failed") or comparison.get("hybridFailed"):
+            failed_cases.append(
+                {
+                    "case": payload["case"]["label"],
+                    "error": comparison.get("error") or comparison.get("hybridError"),
+                }
+            )
+            continue
         if "scoreRatio" in comparison and comparison["scoreRatio"] is not None:
             ratios.append(float(comparison["scoreRatio"]))
             deltas.append(float(comparison["scoreDelta"]))
@@ -323,6 +349,8 @@ def _summarize(cases: Sequence[dict[str, Any]]) -> dict[str, Any]:
             room_ratios.append(float(comparison["evaluateRoomRatio"]))
     return {
         "caseCount": len(cases),
+        "evaluatedCaseCount": len(ratios),
+        "failedCases": failed_cases,
         "wins": wins,
         "losses": losses,
         "ties": len(ratios) - wins - losses,
@@ -503,6 +531,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         if not graph:
             continue
         label = payload["case"]["label"]
+        if graph.get("failed"):
+            add(f"| {label} | - | 失败 | - | - | - | - |")
+            continue
+        if hybrid and hybrid.get("failed"):
+            add(f"| {label} | 失败 | {graph['score']:.3f} | - | - | {graph['wallSeconds']:.2f}s | - |")
+            continue
         if hybrid:
             comparison = payload.get("comparison") or {}
             add(
@@ -591,7 +625,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         runs = payload.get("runs") or {}
         hybrid = runs.get("hybrid")
         graph = runs.get("graph")
-        if not hybrid or not graph:
+        if not graph or graph.get("failed"):
+            continue
+        if not hybrid or hybrid.get("failed"):
             continue
         add(f"### {payload['case']['label']}")
         add("")

@@ -2503,15 +2503,22 @@ class ScheduleOptimizer:
         audit["basePlanCount"] = len(shifts)
         audit["expandedPlanCount"] = len(expanded)
         if not audit["hardGatePassed"]:
+            offenders = audit["unrestedOperators"][:12]
+            ledger = audit.get("moraleLedgerByOperator") or {}
             raise ValueError(
                 "No sustainable morale cycle within seven days: "
                 + ", ".join(audit["failureReasons"])
                 + "; operators="
-                + ", ".join(audit["unrestedOperators"][:12])
+                + ", ".join(offenders)
                 + "; minimum="
                 + ", ".join(
                     f"{name}:{audit['minimumMoraleByOperator'].get(name)}"
-                    for name in audit["unrestedOperators"][:12]
+                    for name in offenders
+                )
+                + "; balance="
+                + ", ".join(
+                    f"{name}:{ledger.get(name, {}).get('balance')}"
+                    for name in offenders
                 )
             )
         return expanded, audit

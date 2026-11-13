@@ -921,3 +921,123 @@ Remaining known defect, deliberately not fixed yet:
   want. A graph-native fix would be a decode-time penalty proportional to each operator's demand
   across the layout's other production rooms (`λ * demand_i` added to the unary adjust). That needs
   tuning and validation, and the residual gap on 243/normal is already only 0.4%.
+
+
+## P8 - Rebase onto origin/main and the Morale-Cycle Hard Gate
+
+Status: rebased (2 local commits on top of 8 upstream commits); conflict in `web_app.py` only
+(both sides added a module constant) and resolved by keeping both. 228 tests pass.
+
+Upstream introduced `morale.py` and a hard gate inside `optimize()` (`_ensure_sustainable_morale_cycle`
++ `audit_morale_cycle`), which raises ValueError when the cycle is not sustainable:
+cycle <= 7 days, every operator leaving work must be resting in that shift's dormitories, no
+active+rest conflict, morale must not deplete and must return to the starting value.
+
+Consequences measured on the maxed fixture:
+- 252 and 342 fail for EVERY mode and shift pattern, for BOTH optimizers
+  (`operator_morale_depleted` / `required_rest_exceeds_dormitory_assignment`). 5-factory layouts
+  cannot produce a sustainable rotation. Default benchmark cases moved to 243/333.
+- `cycleHours` is frequently 48 (upstream expands plans into a rotation), so the pure-gold repeat
+  policy must respect the 7-day cap. Fixed a real crash this introduced: the "max score within
+  tolerance" override scanned all repeat counts and could pick `base_hours * repeat > 168h`,
+  tripping the gate. It now skips those candidates (`stoppedByMaxCycleHours`).
+- `graph_benchmark` is now exception-tolerant: a failing optimizer records `failed`/`error`
+  instead of aborting the report.
+
+Post-rebase comparison (1 win / 3 losses, mean ratio 0.981, simulator calls 0.718x, wall 0.834x):
+- 243 balanced +0.24%, 243 normal -0.39%
+- 333 balanced 3x8 -2.89%, 333 max 2x12 -4.42%
+
+Diagnosis of the 333 regression (measured, not guessed): widening the shortlist makes it WORSE
+(shortlist 128 -> -30.8, shortlist 192/beam 22 -> -35.8) and adding a third start changes nothing,
+so it is not a candidate-width problem. The likely mechanism is that the shortlist maximises ROOM
+score only, while the morale gate now prices **dormitory recovery**; the hybrid enumerates
+everything and therefore stumbles onto rest-friendly picks that the surrogate never nominates.
+
+Next step for closing 333, in order of expected value:
+1. Add dormitory recovery value to the graph: a `dorm recovery` node feature (parsed rate) plus a
+   decode-time term that avoids burning high-recovery operators in work rooms when the rotation
+   needs them for rest. This is the direct analogue of the existing fatigue unary adjustment.
+2. Feed `_ensure_sustainable_morale_cycle`'s rotation structure into the multi-start objective, so
+   the initial-assignment selection sees the same feasibility the final gate will enforce.
+3. Revisit office/meeting selection (still ranked by parsed `score_skill`, ignores `control_hire_spd`).
+
+
+## P9 - Audit of the Upstream Morale Hard Gate (not changed, findings only)
+
+The gate in `morale.py` is directionally right but has four systematic gaps. All four bias the
+verdict toward "stricter than the real game", and three of them are measurable against `data/cache`:
+
+1. Consumption-reduction skills are discarded. 47 buffs use `心情每小时消耗-N` on stripped
+   descriptions (e.g. `power_rec_spd&cost[000] 热情澎湃 -0.52`, `拾荒者/囤积者 -0.25`).
+   `_advance_morale` computes `1.0 + max(0.0, fatigue_delta_from_text(...))`, so the negative is
+   clamped away and consumption is over-estimated.
+2. Control-centre global morale effects are not modelled at all. 79 buff descriptions mention
+   cross-room morale, including `control_clue_cost[000] 神经质` (+1.5/h to every control-centre
+   operator), `control_clue_cost[010] 至察` (+0.5/h), `control_clue_cost&faction[990] 反抗者`
+   (+0.25/h to the others) and seven `control_mp_cost[*]` rows granting +0.05/h recovery.
+3. Dormitory recovery uses only the game base rate. `dormData.manpowerRecover` is 160..200, and
+   `dormitory_base_recovery_rate` correctly reproduces it as 1.6..2.0/h, but that means 0 -> 24
+   takes 12h while practice is closer to 6h once typical `自身心情每小时恢复+0.7..+2.0` dorm skills
+   are counted.
+4. The `某一名/前一位 ... 心情每小时恢复+` regex branch has ZERO matches in the real data, so
+   `single_bonus` is dead code.
+
+Attempted and reverted: raising the effective dormitory rate to `MAX_MORALE / 6h = 4.0/h`
+(the "6-hour refill" budget). It made things strictly worse: every previously feasible case
+(243 and 333, both optimizers) began failing with `cycle_does_not_restore_initial_morale`.
+The same happened when only fix (1) was kept, which is the opposite direction (less consumption).
+
+Diagnosis: `audit_morale_cycle` iterates `_advance_morale` at most 16 times and then compares the
+result of one more step against the stored start state. Whenever an operator sits at the
+`MAX_MORALE = 24` cap the map is not contractive, so the iteration does not reach a fixed point and
+`end_deficit` reports a false negative. The gate is therefore numerically fragile, and its real
+bottleneck is the rotation structure below, not the recovery rate.
+
+Structural finding (the real reason 252/342 are infeasible): the staggering expansion in
+`_ensure_sustainable_morale_cycle` assigns `source_index = ((plan_index + group_count - 1 - group_index) // group_count) % len(shifts)`.
+For 342 / 3x8 / group_count=2 this yields the sequence [0, 1, 1, 2, 2, 0] for a room group, i.e. a
+group works six consecutive 8h plans (48h) with no rest plan at all. No recovery rate can make that
+sustainable; the expansion must guarantee at least one rest plan per group per cycle.
+
+Everything above is documentation only: `morale.py` was reverted to upstream HEAD. The follow-up
+order was: (a) make the audit converge / clamp-safe before comparing start vs end,
+(b) fix the staggering so every group rests at least once per cycle, (c) then re-apply the
+consumption-reduction fix and, if the user still wants it, the 6-hour dormitory budget.
+Step (a) is done, see P10.
+
+
+## P10 - Morale Audit Rewritten as a Per-Operator Balance Sheet
+
+Status: done. `morale.py` audit schema bumped to `version: 2`; `tests/test_morale.py` (11 tests) is
+the new contract. `AGENTS.md`/`docs/handoff_graph_optimizer.md` step 1 is closed.
+
+What changed and why:
+- The verdict is now a closed-form balance sheet per operator over one cycle:
+  `balance = potential_recovery - consumption >= 0` with tolerance `1e-4`
+  (`criterion: per_operator_morale_balance`). Reported per operator in
+  `moraleLedgerByOperator` (`consumption` / `recovery` / `appliedRecovery` / `balance`) and named in
+  `moraleBalanceDeficitOperators`.
+- Recovery in the ledger is **potential** recovery (rate x hours), so resting while already at 24 is
+  not punished; `appliedRecovery` records what actually landed and the difference is the cap waste.
+- `cycle_does_not_restore_initial_morale` is gone. The end-vs-start comparison was the fragile part:
+  the 24 cap discards recovery, so it rejects plans that are perfectly sustainable (rest-before-work
+  ordering), and combined with a 16-step non-contractive replay it can also accept/deny by accident.
+  The replacement failure reason is `morale_balance_deficit`.
+- `minimumMorale` / `endingMoraleByOperator` now come from ONE deterministic cycle starting at 24
+  morale for everybody. A drain is bounded by a single cycle's consumption (12h at 2.5/h used to
+  report `minimumMorale = -102`, now `-6`), so the numbers in the HTML/report are meaningful.
+- `steadyState` (`converged` / `iterations` / `residual` / `maxIterations` / `tolerance`) is a bounded
+  16-step replay kept for diagnostics only. It never gates: state-coupled mechanics (a dormitory
+  skill that targets the lowest-morale neighbour) can orbit forever without making a cycle
+  unsustainable. There is deliberately no `iteration_did_not_converge` failure reason.
+- Unchanged: `required_rest_exceeds_dormitory_assignment`,
+  `operator_active_and_resting_in_same_shift`, `cycle_exceeds_seven_days`,
+  `operator_morale_depleted`, and the `_ensure_sustainable_morale_cycle` staggering. The
+  `ValueError` text now also prints each offender's balance.
+
+Not done yet (unchanged from P9): the dormitory green text (`0.0004 x comfort`) is still missing,
+consumption-reduction skills (`心情每小时消耗-N`) are still clamped away, control-centre global morale
+effects are still unmodelled. Those are step 2 of the handoff and should now be measurable against a
+stable gate.
+

@@ -53,6 +53,7 @@ from .optimizer import (
     target_selection_score,
     unique_candidate_variants,
 )
+from .morale import MAX_CYCLE_HOURS
 from .presets import normalize_mode
 from .production import (
     DEFAULT_PURE_GOLD_TARGET_PER_DAY,
@@ -1196,7 +1197,14 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         evaluated: list[dict[str, Any]] = []
         best_within: tuple[float, int, list, Any] | None = None
         best_any: tuple[float, float, int, list, Any] | None = None
+        # 心情周期硬门槛要求整个循环不超过 7 天（`morale.MAX_CYCLE_HOURS`）。
+        # 父类靠「第一个达标的重复次数就 break」很少撞上，而这里会扫完所有重复次数，
+        # 所以必须自己把超限的候选挡掉，否则会产出过不了门槛的排班。
+        base_cycle_hours = sum(float(shift.duration_hours) for shift in shifts)
         for repeat_count in range(1, max_repeats + 1):
+            if base_cycle_hours * repeat_count > MAX_CYCLE_HOURS + 1e-6:
+                policy["stoppedByMaxCycleHours"] = repeat_count
+                break
             candidate_shifts = (
                 shifts if repeat_count == 1 else repeat_shift_cycle(shifts, repeat_count)
             )
