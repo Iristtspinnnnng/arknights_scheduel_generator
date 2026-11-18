@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import Layout, ShiftPlan
+from .skill_rules import self_contained_recovery_rate
 
 
 MAX_MORALE = 24.0
@@ -190,6 +191,8 @@ def audit_morale_cycle(layout: Layout, shifts: list[ShiftPlan]) -> dict[str, Any
             "Parsed self, single-target, and room-wide recovery bonuses are counted; other bonuses are excluded.",
             "A single-target recovery skill follows the lowest-morale roommate until it is full, "
             "then moves on; its owner is never the target.",
+            "An operator whose recovery cannot come from other sources (自律) only recovers "
+            "its own rate in a dormitory and never receives neighbour bonuses.",
             "A cycle is sustainable when every operator's potential recovery covers its consumption.",
             "Recovery booked while an operator is already at 24 morale is counted as potential recovery only.",
             "Reported minimum and ending morale come from one cycle that starts at 24 morale for everyone.",
@@ -473,14 +476,27 @@ def _recover_dormitory_room(
     as it is and holds it until that operator is full (then the next lowest takes
     over); the skill owner can never be the target. Everything is simulated as a
     sequence of constant-rate segments so the "until full" rule is exact.
+
+    Operators whose recovery cannot come from other sources (``自律``) are handled
+    as **self-contained nodes**: their rate is their own parsed value, the white text,
+    comfort, room-wide skills and control-centre bonus are not added, and they are
+    never a single-target recipient.
     """
     all_bonus, self_bonuses, single = dormitory_recovery_bonuses(room)
     occupants = [skill.operator_name for skill in room.operators]
+    self_contained = _self_contained_recovery_rates(room)
     base_rates = {
-        name: passive + all_bonus + self_bonuses.get(name, 0.0) for name in occupants
+        name: (
+            self_contained[name]
+            if name in self_contained
+            else passive + all_bonus + self_bonuses.get(name, 0.0)
+        )
+        for name in occupants
     }
     single_bonus, owner = single if single is not None else (0.0, None)
-    candidates = [name for name in occupants if name != owner]
+    candidates = [
+        name for name in occupants if name != owner and name not in self_contained
+    ]
 
     remaining = float(hours)
     while remaining > 1e-9 and single_bonus > 0.0 and candidates:
@@ -511,6 +527,16 @@ def _recover_dormitory_room(
             target=None,
             bonus=0.0,
         )
+
+
+def _self_contained_recovery_rates(room: Any) -> dict[str, float]:
+    """Operators whose dormitory recovery is self-provided only (``自律``)."""
+    rates: dict[str, float] = {}
+    for skill in room.operators:
+        rate = self_contained_recovery_rate(skill.description)
+        if rate is not None:
+            rates[skill.operator_name] = rate
+    return rates
 
 
 def _lowest_unfilled(candidates: list[str], morale: dict[str, float]) -> str | None:

@@ -29,6 +29,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .data import GameData
 from .models import BaseSkill, RosterOperator
+from .skill_rules import self_contained_recovery_rate
 
 __all__ = [
     "ROOM_TYPES",
@@ -261,6 +262,8 @@ class StaticOperatorGraph:
             "degreeHistogram": dict(sorted(degree_histogram.items(), key=lambda kv: int(kv[0]))),
             "isolatedOperatorCount": len(isolated),
             "isolatedOperators": isolated[:limit],
+            "specialMoraleNodeCount": len(self.meta.get("specialMoraleNodes") or []),
+            "specialMoraleNodes": list(self.meta.get("specialMoraleNodes") or [])[:limit],
             "signature": self.meta.get("signature"),
             "dataVersion": self.meta.get("dataVersion"),
             "rosterSize": self.meta.get("rosterSize"),
@@ -438,6 +441,17 @@ def build_operator_graph(
         "comboMembersByRoom": {room: len(members) for room, members in combo_by_room.items()},
         "maxFactionGroupSize": max_faction_group_size,
         "featureNames": list(FEATURE_NAMES),
+        # 「自律」这类「无法获得其他来源的心情恢复」的干员按**自给自足的独立节点**处理：
+        # 宿舍等级、氛围、舍友技能、中枢加成都不接到它身上（`morale` 侧同一条规则）。
+        # 这里只做标注，不加 GCN 特征——它对产能读出层没有梯度，只会变成噪声。
+        "specialMoraleNodes": sorted(
+            name
+            for name, skills in skills_by_name.items()
+            if any(
+                self_contained_recovery_rate(skill.description) is not None
+                for skill in skills
+            )
+        ),
     }
     signature = graph_signature(nodes, edges, {"dataVersion": game_data.data_version})
     meta["signature"] = signature

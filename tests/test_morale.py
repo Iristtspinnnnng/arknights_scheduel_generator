@@ -550,6 +550,63 @@ class MoraleModelEffectsTest(unittest.TestCase):
         self.assertAlmostEqual(audit["endingMoraleByOperator"]["低心情"], 24.0)
         self.assertAlmostEqual(audit["endingMoraleByOperator"]["次低"], 24.0)
 
+    def test_self_contained_recovery_ignores_dormitory_level_and_neighbours(self) -> None:
+        """「自律」: recovery cannot come from other sources, so it is a node-local rate."""
+        audit = audit_morale_cycle(
+            dormitory_layout(),  # level 5: passive would be 4.0/h
+            [
+                shift(
+                    "A",
+                    "08:00",
+                    12.0,
+                    working=["值班甲"],
+                    resting=["菲亚梅塔", "舍友"],
+                    descriptions={
+                        "菲亚梅塔": "进驻宿舍时，自身心情每小时恢复+2，"
+                        "同时无法获得其他来源提供的心情恢复效果",
+                        "舍友": "进驻宿舍时，该宿舍内所有干员的心情每小时恢复+0.15",
+                    },
+                ),
+            ],
+        )
+
+        ledger = audit["moraleLedgerByOperator"]
+        # +2/h only: no white text, no comfort, no neighbour bonus.
+        self.assertAlmostEqual(ledger["菲亚梅塔"]["recovery"], 12.0 * 2.0)
+        # The roommate still gets the full passive 4.0 + 0.15.
+        self.assertAlmostEqual(ledger["舍友"]["recovery"], 12.0 * 4.15)
+        self.assertTrue(
+            any("cannot come from other sources" in item for item in audit["assumptions"]),
+            audit["assumptions"],
+        )
+
+    def test_self_contained_recovery_never_receives_the_single_target_bonus(self) -> None:
+        audit = audit_morale_cycle(
+            entry_level_dormitory_layout(),
+            [
+                shift("A", "08:00", 12.0, working=["菲亚梅塔"]),
+                shift(
+                    "B",
+                    "20:00",
+                    2.0,
+                    resting=["医者", "菲亚梅塔", "舍友"],
+                    descriptions={
+                        "菲亚梅塔": "进驻宿舍时，自身心情每小时恢复+2，"
+                        "同时无法获得其他来源提供的心情恢复效果",
+                        "医者": "进驻宿舍时，使该宿舍内除自身以外心情未满的某个干员"
+                        "每小时恢复+0.55（同种效果取最高）",
+                    },
+                ),
+            ],
+        )
+
+        ledger = audit["moraleLedgerByOperator"]
+        # 菲亚梅塔 has the lowest morale (12) but cannot take the neighbour buff.
+        self.assertAlmostEqual(ledger["菲亚梅塔"]["recovery"], 2.0 * 2.0)
+        # 舍友 is full, so the buff has no eligible target and is wasted.
+        self.assertAlmostEqual(ledger["舍友"]["recovery"], 2.0 * 2.0)
+        self.assertAlmostEqual(ledger["医者"]["recovery"], 2.0 * 2.0)
+
     def test_unattributable_morale_clauses_are_reported_not_dropped(self) -> None:
         audit = audit_morale_cycle(
             dormitory_layout(levels=(1, 1, 1, 1)),

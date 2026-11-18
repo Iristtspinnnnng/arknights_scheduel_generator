@@ -8,20 +8,21 @@
 
 ## 0. 一分钟速览
 
-- 分支 `main`，**领先 `origin/main` 5 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
+- 分支 `main`，**领先 `origin/main` 6 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
   `c2d39ba`（社区打分权重 + 显式羁绊 + numpy + 缓存 + 多起手）、
   `d78daad`（心情审计改成收支记账 + 老的基准容错/循环上限）、
   `9e1b605`（宿舍绿字 + 作用域减耗 + 控制中枢 + 父类纯赤金 7 天上限）、
-  以及最后一个「单体宿舍恢复的锁定语义」（`git log -1` 可见，内容见 §2.2 第 4 条）。
+  「单体宿舍恢复的锁定语义」、「菲亚梅塔＝恢复自给自足的特殊节点」（后两个 `git log` 可见，
+  内容见 §2.2 第 4、5 条）。
 - **§3 第 1、2 步已完成**：
   - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 现在是 `version: 3`）；
   - 宿舍补上绿字（`0.0004 × 氛围`）、在岗减耗按作用域解析、控制中枢 −0.05/h × 在岗人数；
   - 单体宿舍恢复（`dorm_rec_single`，26 条）按「锁定最低心情舍友直到回满」的语义启用；
-  - 回归测试 `tests/test_morale.py`（22 个）；
+  - 菲亚梅塔「自律」按「恢复自给自足的特殊节点」建模（图侧只标注、不加特征）；
   - **252/342 现在全部可行**（16/16 组合通过，最差收支 +4.0）。
   细节见 §2、§3、§4。
 - 安全备份分支：`backup/pre-rebase-graph`（rebase 前的原始状态）。
-- 测试：**251 passed / 1 skipped / 1 failed**（含 `tests/test_morale.py` 22 个、纯赤金 7 天上限 1 个）。唯一失败是既有环境问题
+- 测试：**254 passed / 1 skipped / 1 failed**（含 `tests/test_morale.py` 24 个、纯赤金 7 天上限 1 个、图标注 1 个）。唯一失败是既有环境问题
   （`test_calibration_report_examples_pass` 需要仓库外的 `C:\tmp\yituliu_schedule_images_current.js`，
   报 `missing_local_asset`），与本项目改动无关，不要去"修"它。
 - 环境：系统 `python`（WindowsApps，3.13）**没有 pytest**，不能直接跑测试；本轮实际用的是 DSH 自带的
@@ -108,6 +109,14 @@ L5 + 氛围 5000 ⇒ 0→24 恰好 **6 小时**，这就是「六小时回满」
    饱和时间，取 `min(剩余时间, 饱和时间)` 推进，目标是精确的，不是近似迭代。
    见 `_recover_dormitory_room` / `_lowest_unfilled` / `_advance_dormitory_occupants`，
    回归测试 `test_single_target_recovery_*`（3 个）。
+5. **菲亚梅塔「自律」** —— 已建模为**恢复自给自足的特殊节点**（用户提议）。
+   `skill_rules.self_contained_recovery_rate()` 识别「…无法获得其他来源提供的心情恢复效果」，
+   返回她自己的 `+2/h`；`morale._recover_dormitory_room` 把她当独立节点：只按 2.0/h 恢复，
+   **不接**白字/绿字/舍友加成/中枢宿舍加成，也**不会**成为单体技能的目标。
+   图侧在 `graph_features.meta["specialMoraleNodes"]` 里标注（`graph-audit` 的
+   `specialMoraleNodes` 可见），但**不加 GCN 特征**——它只影响心情可行性、对产能读出层没有梯度，
+   加了反而是噪声，还会白白让读出层缓存失效。
+   「患难之交」（满心情换心情）按用户要求**先不管**，仍是未建模项。
 
 ### 2.3 为什么我上一轮加了 4.0/h 下限却全线失败（历史记录，别重复踩）
 
@@ -137,6 +146,33 @@ source_index = ((plan_index + group_count - 1 - group_index) // group_count) % l
 并没有走到这个极端分组：修完判定后 252/342 只是**数值差一点**（缺口 −0.6 ~ −3.6 心情/周期），
 补上绿字和中枢减耗之后 16 种组合全部可行（§4）。所以「必须保证每组每周期至少一个休息计划」
 仍然值得做（是个潜在崩溃点），但已经不是 5 制造站不可行的原因。
+
+### 2.5 电力 → 宿舍等级 → 恢复率：**已建模**（用户问过，结论是有）
+
+链路是完整接通的：
+`power.power_status()` 用 `building_data.rooms[*].phases[*].electricity` 算「供电 − 耗电」；
+`resolve_power_layout()` 在 `--right-side full` 且余量为负时调 `auto_adjust_full_power_layout()`，
+按 `(制造站总工位, 制造站等级和, 宿舍等级和, 余量)` 字典序**先砍制造站、再砍宿舍等级**；
+调整结果写进 `layout.dormitory_levels` 与 `layout.power_adjustment`，而 `morale` 用的正是这个
+`layout.dormitory_levels`。实测（满练表、`full` 预设）：
+
+| 布局 | 初始余量 | 调整后余量 | 宿舍等级 | 恢复率 |
+| --- | --- | --- | --- | --- |
+| 243 / 333（3 发电站） | 0 | 0 | `(5,5,5,5)` | 4.0/h |
+| 252 / 342（2 发电站） | **−330** | 0 | **`(1,1,1,2)`** | **2.0 / 2.5/h** |
+
+也就是说「发电站 3→2 限制宿舍等级」这件事，模型里**真的会扣恢复率**：252/342 的心情账一直是按
+2.0~2.5/h 算的（不是 4.0/h）。两点已知局限（用户决定先不管）：
+1. 砍电力的**优先级**只看「保住制造站工位」，没有把「宿舍降级 → 恢复率下降 → 排班更难」计价；
+2. `guide` / `basic` 预设直接把宿舍钉成 1 级，且 `resolve_power_layout` 只对 `full` 做自动调整，
+   所以 252/342 + `guide` 会留下 `feasible=False` 的电力余量（导出里 `powerStatus.feasible` 可见）。
+
+### 2.6 换班仍然是「批量固定时刻」
+
+`_build_shifts` 给每个 `ShiftPlan` 一个固定 `start`（`shift_times[shift_index % len(shift_times)]`），
+同一班次里所有干员**同一刻上、同一刻下**；`_ensure_sustainable_morale_cycle` 的错峰展开也只是
+把计划数乘成 `base × group_count`，时刻仍沿用同一套网格。没有「某个干员提前 2 小时下班」这种
+个体化换班。若以后要做（Mower 那种逐人换班），需要给 `ShiftPlan` 增加「每人区间」而不是一个 clock。
 
 ---
 

@@ -498,6 +498,27 @@ def fatigue_delta_from_text(text: str) -> float:
     return total
 
 
+#: 「自律」(菲亚梅塔): the operator recovers on its own and cannot receive any other source.
+SELF_CONTAINED_RECOVERY_MARKER = "无法获得其他来源提供的心情恢复"
+
+
+def self_contained_recovery_rate(text: str) -> float | None:
+    """Return the self-provided recovery rate when other morale sources are excluded.
+
+    ``进驻宿舍时，自身心情每小时恢复+2，同时无法获得其他来源提供的心情恢复效果``
+    means the standard dormitory model (white text, comfort, neighbour skills, control
+    centre bonus) must **not** be added to this operator: it only recovers its own rate.
+    """
+    plain = re.sub(r"<[^>]+>", "", text or "")
+    if SELF_CONTAINED_RECOVERY_MARKER not in plain:
+        return None
+    matches = re.findall(
+        r"自身心情每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
+        plain,
+    )
+    return max((float(value) for value in matches), default=0.0)
+
+
 def conditional_morale_unmet_reason(
     skill: BaseSkill,
     description: str,

@@ -673,6 +673,17 @@ class RealDataGraphTest(unittest.TestCase):
         self.assertGreater(report["edgeCountByRelation"]["combo"], 0)
         self.assertIn("德克萨斯", dict(graph.neighbors("拉普兰德", "named")))
 
+    def test_real_graph_marks_self_contained_morale_nodes(self) -> None:
+        """「自律」这类恢复自给自足的干员在图里是**特殊节点**（不接受任何恢复边）。"""
+        graph = build_operator_graph(self.game_data, self.roster)
+        report = graph.audit_report()
+
+        self.assertIn("菲亚梅塔", report["specialMoraleNodes"])
+        self.assertEqual(report["specialMoraleNodeCount"], len(report["specialMoraleNodes"]))
+        self.assertEqual(graph.meta["specialMoraleNodes"], report["specialMoraleNodes"])
+        # 标注不参与 GCN 特征宽度，避免无谓地让读出层缓存失效。
+        self.assertEqual(report["featureWidth"], len(FEATURE_NAMES))
+
     def test_real_optimizer_keeps_guide_mechanism_trio(self) -> None:
         """图短名单必须包含刊例表里 200% 那一行的三人组。"""
         hybrid = ScheduleOptimizer(self.game_data, self.roster, shard_formula="rock")

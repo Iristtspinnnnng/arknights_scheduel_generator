@@ -1116,3 +1116,35 @@ scores and identical worst balances - the dormitory helpers do not enter the pro
 only makes the morale ledger more honest. Remaining known gap: `患难之交` (心情交换) is still unmodelled,
 and `dorm_rec_all&tired` / `&unfull` conditional extra bonuses are ignored (they only add recovery).
 
+
+## P13 - Fiammetta as a Self-Contained Recovery Node
+
+Status: done. `自律` (`dorm_recExcludeOther[000]`) reads "自身心情每小时恢复+2，同时无法获得其他来源
+提供的心情恢复效果". The old model added the +2 to the normal dormitory stack (passive up to 4.0/h +
+neighbour skills + control bonus), which over-credited her by up to +4/h.
+
+Modelling (the user's suggestion: treat her as a special node):
+- `skill_rules.self_contained_recovery_rate(text)` detects the "无法获得其他来源提供的心情恢复" marker
+  and returns the operator's own parsed rate.
+- `morale._recover_dormitory_room` keeps such operators **node-local**: their rate is their own value,
+  white text / comfort / room-wide skills / the control-centre dorm bonus are not added, and they are
+  never a candidate for `dorm_rec_single`.
+- `graph_features` annotates them in `meta["specialMoraleNodes"]` (surfaced by `graph-audit` as
+  `specialMoraleNodes` / `specialMoraleNodeCount`) **without** adding a GCN feature: the mechanic only
+  affects morale feasibility, gives the production readout no gradient, and a widened feature vector
+  would invalidate the cached readout layer for nothing.
+- Tests: 2 in `tests/test_morale.py` (level/neighbour immunity, single-target immunity) + 1 in
+  `tests/test_graph_optimizer.py` (graph annotation).
+- `患难之交` (full-morale morale swap) is deliberately left unmodelled, per the user ("精细的恢复先不管").
+- Feasibility scan unchanged: 16/16 pass with identical scores; she is not picked as a dormitory helper
+  in any scanned schedule.
+
+Two facts confirmed for the record (also written into `docs/graph_optimizer.md` 5b and handoff 2.5/2.6):
+- Shift changes are still **batch, fixed clock times**: one `ShiftPlan` = one `start`, everybody swaps at
+  the same boundaries; the morale staggering only multiplies plans, never individual swap times.
+- Power plant count -> dormitory level -> recovery **is** modelled: `power.resolve_power_layout` lowers
+  manufacture levels first and then dormitory levels when `--right-side full` does not fit the power
+  budget. 252/342 (2 power plants) end at dorm levels `(1,1,1,2)`, i.e. 2.0-2.5/h instead of 4.0/h.
+  Known limits: the fit does not price the morale cost of lowering dormitory levels, and the
+  `guide`/`basic` presets skip the adjustment entirely (252/342 + guide keeps `feasible=False`).
+
