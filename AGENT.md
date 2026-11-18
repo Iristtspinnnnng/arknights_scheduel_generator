@@ -169,6 +169,12 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
   换班仍是**批量固定时刻**（一个 `ShiftPlan` 一个 `start`，全员同时上下班）。
   发电站数量→电力→宿舍等级→恢复率**已建模**（`power.resolve_power_layout`，252/342 会落到
   `(1,1,1,2)`，恢复率 2.0~2.5/h）。
+- 宿舍分配口径（M1，2026-11）：宿舍是**一等分配目标**。`_assign_dormitory_quarters` 对**整条排班**
+  跑一次 beam（`deficit` 先补缺口 / `recovery` 先最大化总恢复）+ 旧贪心共三个候选，
+  用心情审计自己的账本 `(hardGatePassed, 最差收支, 总恢复)` 择优，所以不会比旧贪心差。
+  落点是 `_ensure_sustainable_morale_cycle`，**不要**放回 `_build_shifts` / `_rebuild_dormitories`
+  （解码热路径，实测 6× 墙钟、结果不变）。宿舍速率只有 `morale.dormitory_recovery_rates` 一个入口，
+  优化器不许另写正则。宿舍**不进产能分**（`room_output_score` 不动，测试锁死）。
 
 ## 最近用户样例结论
 

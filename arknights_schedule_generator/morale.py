@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from .models import Layout, ShiftPlan
 from .skill_rules import self_contained_recovery_rate
@@ -429,10 +429,7 @@ def _simulate_cycle(
             for room in shift.rooms
             for effect in effects[room.room_id]
         )
-        dormitory_boost = max(
-            (effect.all_dormitories_recovery for effect in control_effects),
-            default=0.0,
-        )
+        dormitory_boost = _dormitory_boost_from_effects(control_effects)
 
         for room in shift.rooms:
             room_effects = effects[room.room_id]
@@ -482,17 +479,10 @@ def _recover_dormitory_room(
     comfort, room-wide skills and control-centre bonus are not added, and they are
     never a single-target recipient.
     """
-    all_bonus, self_bonuses, single = dormitory_recovery_bonuses(room)
+    single = dormitory_single_target(room)
     occupants = [skill.operator_name for skill in room.operators]
     self_contained = _self_contained_recovery_rates(room)
-    base_rates = {
-        name: (
-            self_contained[name]
-            if name in self_contained
-            else passive + all_bonus + self_bonuses.get(name, 0.0)
-        )
-        for name in occupants
-    }
+    base_rates = dormitory_recovery_rates(room, passive)
     single_bonus, owner = single if single is not None else (0.0, None)
     candidates = [
         name for name in occupants if name != owner and name not in self_contained
@@ -631,6 +621,38 @@ def dormitory_passive_recovery_rate(room_level: int) -> float:
     )
 
 
+def dormitory_operator_bonuses(skill: Any) -> tuple[float, float, float | None]:
+    """Parse one dormitory skill into ``(room_wide, own, single_target)`` bonuses.
+
+    This is the single regex layer behind :func:`dormitory_recovery_bonuses`; the
+    optimizer's dormitory value model parses skill-by-skill through it so that both
+    sides read exactly the same numbers.
+    """
+    description = re.sub(r"<[^>]+>", "", skill.description)
+    all_bonus = 0.0
+    all_matches = re.findall(
+        r"所有干员(?:的)?心情每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
+        description,
+    )
+    if all_matches:
+        all_bonus = max(float(value) for value in all_matches)
+    own_bonus = 0.0
+    self_matches = re.findall(
+        r"自身心情每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
+        description,
+    )
+    if self_matches:
+        own_bonus = max(float(value) for value in self_matches)
+    single_bonus: float | None = None
+    single_matches = re.findall(
+        r"(?:某一名|某个|前一位).{0,12}?每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
+        description,
+    )
+    if single_matches:
+        single_bonus = max(float(value) for value in single_matches)
+    return all_bonus, own_bonus, single_bonus
+
+
 def dormitory_recovery_bonuses(
     room: Any,
 ) -> tuple[float, dict[str, float], tuple[float, str] | None]:
@@ -643,28 +665,91 @@ def dormitory_recovery_bonuses(
     single: tuple[float, str] | None = None
     self_bonuses: dict[str, float] = {}
     for skill in room.operators:
-        description = re.sub(r"<[^>]+>", "", skill.description)
-        all_matches = re.findall(
-            r"所有干员(?:的)?心情每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
-            description,
-        )
-        if all_matches:
-            all_bonus = max(all_bonus, *(float(value) for value in all_matches))
-        self_matches = re.findall(
-            r"自身心情每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
-            description,
-        )
-        if self_matches:
-            self_bonuses[skill.operator_name] = max(float(value) for value in self_matches)
-        single_matches = re.findall(
-            r"(?:某一名|某个|前一位).{0,12}?每小时恢复(?:速度)?\+([0-9]+(?:\.[0-9]+)?)",
-            description,
-        )
-        if single_matches:
-            bonus = max(float(value) for value in single_matches)
-            if single is None or bonus > single[0]:
-                single = (bonus, skill.operator_name)
+        skill_all, skill_own, skill_single = dormitory_operator_bonuses(skill)
+        all_bonus = max(all_bonus, skill_all)
+        if skill_own > 0.0:
+            self_bonuses[skill.operator_name] = max(
+                self_bonuses.get(skill.operator_name, 0.0),
+                skill_own,
+            )
+        if skill_single is not None and (single is None or skill_single > single[0]):
+            single = (skill_single, skill.operator_name)
     return all_bonus, self_bonuses, single
+
+
+def dormitory_single_target(room: Any) -> tuple[float, str] | None:
+    """The sticky ``某个干员`` recovery effect of one dormitory, if any."""
+    _, _, single = dormitory_recovery_bonuses(room)
+    return single
+
+
+def dormitory_recovery_rates(room: Any, passive: float) -> dict[str, float]:
+    """Per-operator dormitory recovery rate: 白字 + 绿字 + 房间/自身技能.
+
+    ``passive`` is :func:`dormitory_passive_recovery_rate` for the room level plus
+    the control-centre ``所有宿舍内`` boost. The room-wide bonus is the **maximum**
+    over occupants, exactly as in :func:`dormitory_recovery_bonuses`. Self-contained
+    nodes (``自律``) ignore the passive and every bonus and only recover their own
+    rate. The sticky single-target bonus is *not* included here: it lands on one
+    roommate at a time (see :func:`dormitory_single_target`).
+
+    The morale audit and the optimizer's dormitory value model both go through this
+    function, so "the beam thinks it is worth it" and "the audit books it" cannot
+    drift apart.
+    """
+    all_bonus, self_bonuses, _ = dormitory_recovery_bonuses(room)
+    self_contained = _self_contained_recovery_rates(room)
+    rates: dict[str, float] = {}
+    for skill in room.operators:
+        name = skill.operator_name
+        if name in self_contained:
+            rates[name] = self_contained[name]
+        else:
+            rates[name] = passive + all_bonus + self_bonuses.get(name, 0.0)
+    return rates
+
+
+def _dormitory_boost_from_effects(effects: Iterable[MoraleEffects]) -> float:
+    """Largest ``所有宿舍内`` recovery bonus among (control-centre) parsed effects."""
+    return max((effect.all_dormitories_recovery for effect in effects), default=0.0)
+
+
+def control_dormitory_boost(shift: ShiftPlan) -> float:
+    """Room-wide dormitory recovery the control centre grants (``所有宿舍内``)."""
+    control_rooms = [room for room in shift.rooms if room.room_type == "CONTROL"]
+    if not control_rooms:
+        return 0.0
+    room_names = {
+        skill.operator_name
+        for room in shift.rooms
+        for skill in room.operators
+    }
+    return _dormitory_boost_from_effects(
+        parse_morale_effects(skill.description, room_names)
+        for room in control_rooms
+        for skill in room.operators
+    )
+
+
+def morale_consumption_by_operator(
+    layout: Layout,
+    shifts: list[ShiftPlan],
+) -> dict[str, float]:
+    """Per-operator morale consumption over one cycle, booked by the audit itself.
+
+    One deterministic replay (not the fixed-point diagnostic), so the optimizer can
+    weigh dormitory beds by how much morale each operator actually spends.
+    """
+    names = {
+        skill.operator_name
+        for shift in shifts
+        for room in [*shift.rooms, *shift.dormitories]
+        for skill in room.operators
+    }
+    if not names:
+        return {}
+    trace = _simulate_cycle(layout, shifts, {name: MAX_MORALE for name in names})
+    return {name: trace.consumption.get(name, 0.0) for name in names}
 
 
 def _failed_audit(

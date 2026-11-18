@@ -3,12 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from itertools import combinations, product
 from time import perf_counter
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import dependency_parser
 from .data import GameData
 from .models import BaseSkill, Layout, RoomAssignment, RosterOperator, ShiftPlan
-from .morale import MAX_CYCLE_HOURS, audit_morale_cycle
+from .morale import (
+    MAX_CYCLE_HOURS,
+    audit_morale_cycle,
+    control_dormitory_boost,
+    dormitory_operator_bonuses,
+    dormitory_passive_recovery_rate,
+    dormitory_recovery_rates,
+    morale_consumption_by_operator,
+)
 from .power import PowerStatus, levels_or_default, resolve_power_layout
 from .presets import (
     manufacture_targets,
@@ -35,7 +43,11 @@ from .production import (
     resource_balance_quality,
 )
 from .room_limits import clamp_station_count
-from .skill_rules import evaluate_room_effect, fatigue_delta_from_text
+from .skill_rules import (
+    evaluate_room_effect,
+    fatigue_delta_from_text,
+    self_contained_recovery_rate,
+)
 
 
 ROOM_NAMES = {
@@ -50,6 +62,12 @@ ROOM_NAMES = {
 
 DIAGNOSTIC_INSERTION_GROUP_LIMIT = 64
 JOINT_PRODUCTION_CANDIDATE_LIMIT = 64
+#: M1：宿舍 beam 的搜索宽度 / 候选池上限。
+#: 目标 = 先补心情缺口（封顶效用），总账面恢复只做并列时的次级目标，
+#: 所以次级权重取一个远小于 1 心情的系数。
+DORMITORY_BEAM_WIDTH = 8
+DORMITORY_POOL_LIMIT = 40
+DORMITORY_RECOVERY_TIEBREAK = 1e-6
 COMBO_CANDIDATE_TOP_LIMIT = 14
 COMBO_CANDIDATE_POOL_LIMIT = 32
 OPTIMIZER_MODEL_VERSION = 22
@@ -80,6 +98,21 @@ class RoomSpec:
     capacity: int
     room_level: int = 3
     slots: int | None = None
+
+
+@dataclass(frozen=True)
+class DormitoryRecoveryProfile:
+    """一个干员在宿舍里的恢复分量，解析口径与心情审计完全一致。
+
+    ``room_wide`` 是「该宿舍内所有干员」加成（同宿舍取最大，不是相加）；
+    ``own`` 是「自身」加成；``single`` 是「除自身以外的某个干员」加成（只有持有者
+    这一项有意义）；``self_contained`` 是「自律」那类恢复自给自足节点，只吃自己的值。
+    """
+
+    room_wide: float
+    own: float
+    single: float | None
+    self_contained: float | None
 
 
 @dataclass(frozen=True)
@@ -232,6 +265,9 @@ class ScheduleOptimizer:
         self.operator_anchor_preference: set[str] = set()
         self.operator_anchor_rank: dict[str, int] = {}
         self.forced_insertion_groups: tuple[ShiftInsertionGroup, ...] = ()
+        self._dormitory_profile_cache: dict[
+            tuple[str, str, str], DormitoryRecoveryProfile
+        ] = {}
 
     def optimize(
         self,
@@ -623,7 +659,6 @@ class ScheduleOptimizer:
                 shift_count=shift_count or 2,
                 shift_hours=shift_hours or 12,
             )
-        dorm_specs = self._dorm_specs(layout)
         work_shifts: list[dict[str, Any]] = []
         warnings: list[str] = []
         previous_active: set[str] = set()
@@ -660,6 +695,9 @@ class ScheduleOptimizer:
                 }
             )
 
+        # 初始排班先按老办法（逐班次贪心）填宿舍：这一步在解码里被调用很多次，
+        # 而宿舍不影响产能分，真正的一等分配在 `_ensure_sustainable_morale_cycle`
+        # 里对**整条排班**做一次 beam（见那里的说明）。
         shifts: list[ShiftPlan] = []
         active_by_shift = [set(shift["active_names"]) for shift in work_shifts]
         visible_anchor_names = {
@@ -668,6 +706,7 @@ class ScheduleOptimizer:
             for name in active_names
             if name in self.operator_anchor_preference
         }
+        dorm_specs = self._dorm_specs(layout)
         for shift_index, work_shift in enumerate(work_shifts):
             active_names = set(work_shift["active_names"])
             rest_priority = self._rest_priority(active_by_shift, shift_index)
@@ -2354,6 +2393,12 @@ class ScheduleOptimizer:
         return True
 
     def _rebuild_dormitories(self, layout: Layout, shifts: list[ShiftPlan]) -> list[ShiftPlan]:
+        """房间改动后重算宿舍。
+
+        这里必须保持**便宜**：它处在插入/替换搜索的热路径上（一次 ``optimize()`` 会被调
+        几百次），而宿舍不参与产能分，这一层的选择不会影响搜索方向。真正的
+        一等分配（beam）在 ``_ensure_sustainable_morale_cycle`` 里对最终排班做一次。
+        """
         dorm_specs = self._dorm_specs(layout)
         active_by_shift = [self._active_names(shift) for shift in shifts]
         rebuilt: list[ShiftPlan] = []
@@ -2366,7 +2411,11 @@ class ScheduleOptimizer:
                     start=shift.start,
                     duration_hours=shift.duration_hours,
                     rooms=list(shift.rooms),
-                    dormitories=self._assign_dormitories(dorm_specs, active_names, rest_priority),
+                    dormitories=self._assign_dormitories(
+                        dorm_specs,
+                        active_names,
+                        rest_priority,
+                    ),
                 )
             )
         return self._improve_dormitory_anchor_coverage(rebuilt)
@@ -2376,8 +2425,27 @@ class ScheduleOptimizer:
         layout: Layout,
         shifts: list[ShiftPlan],
     ) -> tuple[list[ShiftPlan], dict[str, Any]]:
+        """心情周期硬门槛，同时是宿舍一等分配的**唯一落点**。
+
+        M1 的宿舍 beam 放在这里而不是解码的每个班次里，原因有两个：
+
+        1. 床位是跨班次共享的稀缺资源（243：4 间 × 5 床 vs 29 个在岗），
+           逐班次看不到「谁整个周期最缺心情」；
+        2. 解码热路径上一次 ``optimize()`` 会重建几百次宿舍，而宿舍不进产能分，
+           在那一层做 beam 只是把墙钟时间乘上几倍（实测 17.7s → 107.6s），
+           对最终排班没有任何影响。
+
+        所以：门槛已经通过时用 beam 升级一次宿舍再复核；没过时先做错峰展开
+       （必休的人是硬约束），再对展开后的整条排班做 beam。
+        """
         audit = audit_morale_cycle(layout, shifts)
         if audit["hardGatePassed"]:
+            upgraded = self._improve_dormitory_anchor_coverage(
+                self._assign_dormitory_quarters(layout, shifts)
+            )
+            upgraded_audit = audit_morale_cycle(layout, upgraded)
+            if upgraded_audit["hardGatePassed"]:
+                return upgraded, upgraded_audit
             return shifts, audit
         if len(shifts) < 2:
             raise ValueError(
@@ -2386,7 +2454,7 @@ class ScheduleOptimizer:
             )
 
         dorm_specs = self._dorm_specs(layout)
-        dorm_capacity = sum(spec[3] for spec in dorm_specs)
+        dorm_capacity = sum(spec.capacity for spec in dorm_specs)
         room_order = [room.room_id for room in shifts[0].rooms]
         room_weights = {
             room_id: max(
@@ -2471,38 +2539,40 @@ class ScheduleOptimizer:
                 )
             expanded_rooms.append(rooms)
 
-        expanded: list[ShiftPlan] = []
         active_by_plan = [
             {skill.operator_name for room in rooms for skill in room.operators}
             for rooms in expanded_rooms
         ]
-        for plan_index, rooms in enumerate(expanded_rooms):
-            template = shifts[plan_index % len(shifts)]
-            active_names = active_by_plan[plan_index]
-            outgoing = active_by_plan[plan_index - 1] - active_names
-            dormitories = self._assign_required_rest_dormitories(
-                dorm_specs,
-                active_names,
-                outgoing,
+        required_rest_by_plan = [
+            active_by_plan[plan_index - 1] - active_by_plan[plan_index]
+            for plan_index in range(len(expanded_rooms))
+        ]
+        expanded: list[ShiftPlan] = [
+            ShiftPlan(
+                name=shift_label(plan_index),
+                start=shifts[plan_index % len(shifts)].start,
+                duration_hours=shifts[plan_index % len(shifts)].duration_hours,
+                rooms=rooms,
+                dormitories=[],
             )
+            for plan_index, rooms in enumerate(expanded_rooms)
+        ]
+        # 「离岗的人必须有床」是硬约束，剩余床位按价值填充（M1：整条展开后的排班一起定价）。
+        expanded = self._assign_dormitory_quarters(
+            layout,
+            expanded,
+            required_rest=required_rest_by_plan,
+        )
+        for plan_index, shift in enumerate(expanded):
             resting = {
                 skill.operator_name
-                for room in dormitories
+                for room in shift.dormitories
                 for skill in room.operators
             }
-            if not outgoing <= resting:
+            if not required_rest_by_plan[plan_index] <= resting:
                 raise ValueError(
                     "No sustainable morale cycle: required outgoing operators exceed dormitory capacity."
                 )
-            expanded.append(
-                ShiftPlan(
-                    name=shift_label(plan_index),
-                    start=template.start,
-                    duration_hours=template.duration_hours,
-                    rooms=rooms,
-                    dormitories=dormitories,
-                )
-            )
 
         audit = audit_morale_cycle(layout, expanded)
         audit["rotationGroups"] = [list(group) for group in groups]
@@ -2532,11 +2602,16 @@ class ScheduleOptimizer:
 
     def _assign_required_rest_dormitories(
         self,
-        dorm_specs: list[tuple[str, str, None, int]],
+        dorm_specs: list[RoomSpec],
         active_names: set[str],
         required_rest: set[str],
     ) -> list[RoomAssignment]:
-        total_capacity = sum(spec[3] for spec in dorm_specs)
+        """贪心版本：先把必休的人放进去，再用「全员/单体恢复」技能当帮手。
+
+        M1 之后这是 beam 的**保底基线**（beam 账面恢复更差时回退到它），
+        不再是主路径。
+        """
+        total_capacity = sum(spec.capacity for spec in dorm_specs)
         if len(required_rest) > total_capacity:
             return []
         helper_limit = min(len(dorm_specs), total_capacity - len(required_rest))
@@ -2562,7 +2637,7 @@ class ScheduleOptimizer:
             available_rooms = [
                 index
                 for index, spec in enumerate(dorm_specs)
-                if len(selected_by_room[index]) < spec[3]
+                if len(selected_by_room[index]) < spec.capacity
             ]
             if not available_rooms:
                 break
@@ -2582,7 +2657,10 @@ class ScheduleOptimizer:
         )
         filler_index = 0
         for room_index, spec in enumerate(dorm_specs):
-            while len(selected_by_room[room_index]) < spec[3] and filler_index < len(fillers):
+            while (
+                len(selected_by_room[room_index]) < spec.capacity
+                and filler_index < len(fillers)
+            ):
                 candidate = fillers[filler_index]
                 filler_index += 1
                 if candidate.skill.operator_name in selected_names:
@@ -2591,15 +2669,8 @@ class ScheduleOptimizer:
                 selected_names.add(candidate.skill.operator_name)
 
         return [
-            RoomAssignment(
-                room_id=room_id,
-                room_type=room_type,
-                room_name=ROOM_NAMES.get(room_type, room_type),
-                target=target,
-                operators=[candidate.skill for candidate in selected_by_room[index]],
-                score=round(sum(candidate.score for candidate in selected_by_room[index]), 3),
-            )
-            for index, (room_id, room_type, target, _) in enumerate(dorm_specs)
+            self._dormitory_assignment(spec, selected_by_room[index])
+            for index, spec in enumerate(dorm_specs)
         ]
 
     def _improve_dormitory_anchor_coverage(self, shifts: list[ShiftPlan]) -> list[ShiftPlan]:
@@ -2740,15 +2811,23 @@ class ScheduleOptimizer:
 
     def _assign_dormitories(
         self,
-        dorm_specs: list[tuple[str, str, None, int]],
+        dorm_specs: list[RoomSpec],
         active_names: set[str],
         rest_priority: list[str],
         visible_anchor_names: set[str] | None = None,
     ) -> list[RoomAssignment]:
+        """贪心版本（重组前的老实现）：先按离岗顺序，再看锚点偏好。
+
+        M1 之后它是 beam 的**保底基线**：beam 的账面恢复不更优时回退到这里。
+        """
         visible_anchor_names = visible_anchor_names or set()
         dormitories: list[RoomAssignment] = []
         selected_names: set[str] = set()
-        for room_id, room_type, target, capacity in dorm_specs:
+        for spec in dorm_specs:
+            room_id = spec.room_id
+            room_type = spec.room_type
+            target = spec.target
+            capacity = spec.capacity
             rest_priority_names: set[str] = set()
             room_candidates = [
                 candidate
@@ -2813,9 +2892,642 @@ class ScheduleOptimizer:
                     target=target,
                     operators=operators,
                     score=round(score, 3),
+                    room_level=spec.room_level,
+                    slots=spec.capacity,
                 )
             )
         return dormitories
+
+    # ------------------------------------------------------------------
+    # M1：宿舍作为解码的一等目标（整条排班一次 beam）
+    # ------------------------------------------------------------------
+    def _assign_dormitory_quarters(
+        self,
+        layout: Layout,
+        shifts: list[ShiftPlan],
+        *,
+        required_rest: Sequence[Iterable[str]] | None = None,
+    ) -> list[ShiftPlan]:
+        """把整条排班的宿舍一次性分配，取代「逐班次事后贪心」。
+
+        为什么必须整条排班一起算：
+
+        * 床位是**跨班次**共享的稀缺资源（243 是 4 间 × 5 床 vs 29 个在岗），
+          逐班次贪心只能看到「这个班次谁离岗了」，看不到「谁整个周期最缺心情」；
+        * 宿舍恢复的价值必须用**同一套** ``morale`` 速率函数定价（白字 + 绿字 +
+          技能，含自律节点的特殊口径），否则 beam 认为划算、硬门槛却判不达标。
+
+        ``required_rest`` 给出每个班次「必须上床」的人（错峰展开后的离岗者），
+        这是硬约束；剩余床位按价值填充。返回值保持 ``shifts`` 的顺序、且
+        ``shift.dormitories`` 与 ``_dorm_specs`` 的下标一致——心情审计正是按
+        下标去查 ``layout.dormitory_levels``。
+
+        交付方式是一个**三候选组合**，再用心情审计自己的账本择优：
+
+        1. ``deficit`` beam：先补每个人的心情缺口（封顶效用）；
+        2. ``recovery`` beam：先最大化总账面恢复（余量）；
+        3. 现贪心（M1 之前的行为）——它就是保底基线。
+
+        比较键是审计的真实读数 ``(是否过门槛, 最差收支, 总恢复)``，所以
+        「M1 提高余量、但不消耗最差收支」不是靠手调权重保证的，而是由
+        门槛自己的账本裁决。
+        """
+        specs = self._dorm_specs(layout)
+        self._dormitory_profile_cache.clear()
+        if not shifts:
+            return []
+        if not specs:
+            return [replace(shift, dormitories=[]) for shift in shifts]
+        self._record_runtime_count("dormitoryQuarterAssignments")
+        started = perf_counter()
+        required_by_shift = [
+            {str(name) for name in names}
+            for names in (
+                required_rest
+                if required_rest is not None
+                else [() for _ in shifts]
+            )
+        ]
+        required_by_shift.extend(
+            set() for _ in range(len(shifts) - len(required_by_shift))
+        )
+        stripped = [replace(shift, dormitories=[]) for shift in shifts]
+        # 消费量取自审计自己的记账：need 与硬门槛用同一个 morale 模型。
+        consumption = morale_consumption_by_operator(layout, stripped)
+        active_by_shift = [self._active_names(shift) for shift in shifts]
+        candidates = [
+            self._beam_dormitory_plan(
+                specs,
+                shifts,
+                required_by_shift,
+                consumption,
+                active_by_shift,
+                mode=mode,
+            )
+            for mode in ("deficit", "recovery")
+        ]
+        candidates.append(
+            self._greedy_dormitory_plan(
+                specs,
+                shifts,
+                required_by_shift,
+                active_by_shift,
+            )
+        )
+        chosen = self._select_dormitory_plan(layout, candidates)
+        self._record_runtime_time("dormitoryQuarters", perf_counter() - started)
+        return chosen
+
+    def _beam_dormitory_plan(
+        self,
+        specs: list[RoomSpec],
+        shifts: list[ShiftPlan],
+        required_by_shift: Sequence[set[str]],
+        consumption: Mapping[str, float],
+        active_by_shift: Sequence[set[str]],
+        *,
+        mode: str,
+    ) -> list[ShiftPlan]:
+        """按班次顺序做 beam，``covered`` 在班次之间滚存（这就是「跨班次分摊床位」）。"""
+        levels = {spec.room_id: spec.room_level for spec in specs}
+        covered: dict[str, float] = {}
+        assigned: list[ShiftPlan] = []
+        for index, shift in enumerate(shifts):
+            dwell_hours = float(shift.duration_hours)
+            dormitory_boost = control_dormitory_boost(shift)
+            active_names = active_by_shift[index]
+            need = {
+                name: max(0.0, value - covered.get(name, 0.0))
+                for name, value in consumption.items()
+                if name not in active_names
+            }
+            required = required_by_shift[index]
+            pool = self._dormitory_candidate_pool(
+                active_names,
+                need,
+                required=required,
+            )
+            dormitories = self._beam_dormitory_rooms(
+                specs,
+                pool,
+                required=required,
+                need=need,
+                dwell_hours=dwell_hours,
+                dormitory_boost=dormitory_boost,
+                mode=mode,
+            )
+            assigned.append(replace(shift, dormitories=dormitories))
+            for room in dormitories:
+                rates = dormitory_recovery_rates(
+                    room,
+                    dormitory_passive_recovery_rate(levels[room.room_id])
+                    + dormitory_boost,
+                )
+                for name, rate in rates.items():
+                    covered[name] = covered.get(name, 0.0) + rate * dwell_hours
+        return assigned
+
+    def _greedy_dormitory_plan(
+        self,
+        specs: list[RoomSpec],
+        shifts: list[ShiftPlan],
+        required_by_shift: Sequence[set[str]],
+        active_by_shift: Sequence[set[str]],
+    ) -> list[ShiftPlan]:
+        """M1 之前的逐班次贪心（保底基线）。"""
+        return [
+            replace(
+                shift,
+                dormitories=self._greedy_dormitory_rooms(
+                    specs,
+                    active_by_shift[index],
+                    required_by_shift[index],
+                    self._rest_priority(active_by_shift, index),
+                ),
+            )
+            for index, shift in enumerate(shifts)
+        ]
+
+    def _select_dormitory_plan(
+        self,
+        layout: Layout,
+        candidates: Sequence[list[ShiftPlan]],
+    ) -> list[ShiftPlan]:
+        """用心情审计自己的账本挑宿舍分配：门槛 → 最差收支 → 总恢复。
+
+        去重后再比，所以「beam 与贪心给出同一份分配」时只多花一次审计。
+        """
+        best: list[ShiftPlan] | None = None
+        best_key: tuple[bool, float, float] | None = None
+        seen: set[tuple[Any, ...]] = set()
+        for plan in candidates:
+            signature = dormitory_plan_signature(plan)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            key = self._dormitory_plan_key(layout, plan)
+            if best_key is None or key > best_key:
+                best, best_key = plan, key
+        assert best is not None
+        return best
+
+    def _dormitory_plan_key(
+        self,
+        layout: Layout,
+        shifts: Sequence[ShiftPlan],
+    ) -> tuple[bool, float, float]:
+        audit = audit_morale_cycle(layout, list(shifts))
+        ledger = audit.get("moraleLedgerByOperator") or {}
+        worst = min(
+            (float(item.get("balance", 0.0)) for item in ledger.values()),
+            default=0.0,
+        )
+        total_recovery = sum(
+            float(item.get("recovery", 0.0)) for item in ledger.values()
+        )
+        return (
+            bool(audit.get("hardGatePassed")),
+            round(worst, 6),
+            round(total_recovery, 6),
+        )
+
+    def _greedy_dormitory_rooms(
+        self,
+        specs: list[RoomSpec],
+        active_names: set[str],
+        required_rest: set[str],
+        rest_priority: list[str],
+    ) -> list[RoomAssignment]:
+        """保底基线：错峰展开用必休贪心，普通排班用离岗顺序贪心。"""
+        if required_rest:
+            return self._assign_required_rest_dormitories(
+                specs,
+                active_names,
+                required_rest,
+            )
+        return self._assign_dormitories(specs, active_names, rest_priority)
+
+    def _dormitory_candidate_pool(
+        self,
+        active_names: set[str],
+        need: Mapping[str, float],
+        *,
+        required: Iterable[str],
+    ) -> list[Candidate]:
+        """候选池：必休的人 + 最缺心情的人，上限 ``DORMITORY_POOL_LIMIT``。
+
+        真实练度表有 447 行，离岗候选动辄几百人；全池逐个算边际价值会慢一个数量级，
+        而床位只有 20 张，前 N 个最缺心情的人足够覆盖最有价值的组合。
+        """
+        candidates = self._candidates(
+            "DORMITORY",
+            None,
+            set(active_names),
+            allow_no_skill=True,
+        )
+        required_names = {str(name) for name in required}
+        candidates.sort(
+            key=lambda candidate: (
+                int(candidate.skill.operator_name in required_names),
+                need.get(candidate.skill.operator_name, 0.0),
+                candidate.score,
+                candidate.skill.unlocked,
+            ),
+            reverse=True,
+        )
+        chosen: list[Candidate] = [
+            candidate
+            for candidate in candidates
+            if candidate.skill.operator_name in required_names
+        ]
+        chosen_names = {candidate.skill.operator_name for candidate in chosen}
+        for candidate in candidates:
+            if len(chosen) >= DORMITORY_POOL_LIMIT:
+                break
+            name = candidate.skill.operator_name
+            if name in chosen_names:
+                continue
+            chosen.append(candidate)
+            chosen_names.add(name)
+        return chosen
+
+    def _beam_dormitory_rooms(
+        self,
+        specs: list[RoomSpec],
+        pool: list[Candidate],
+        *,
+        required: Iterable[str],
+        need: Mapping[str, float],
+        dwell_hours: float,
+        dormitory_boost: float,
+        mode: str = "deficit",
+        beam_width: int = DORMITORY_BEAM_WIDTH,
+    ) -> list[RoomAssignment]:
+        """一间宿舍一间宿舍地做 beam：必休者先落位，空床位按 ``mode`` 的优先级填。
+
+        ``mode="deficit"``：先把每个人这个班次的心情缺口补上（封顶效用，超出部分
+        不再加分），并列时才比总账面恢复；``mode="recovery"``：直接最大化总账面恢复。
+        两份候选最后都交给心情审计的账本裁决（见 ``_select_dormitory_plan``）。
+        """
+        by_name = {candidate.skill.operator_name: candidate for candidate in pool}
+        required_names = {name for name in required if name in by_name}
+        occupants: list[list[Candidate]] = [[] for _ in specs]
+
+        for name in sorted(required_names, key=lambda item: (-need.get(item, 0.0), item)):
+            candidate = by_name[name]
+            options = [
+                index
+                for index, spec in enumerate(specs)
+                if len(occupants[index]) < spec.capacity
+            ]
+            if not options:
+                break
+            target_room = max(
+                options,
+                key=lambda index: self._dormitory_insertion_key(
+                    specs[index],
+                    occupants[index],
+                    candidate,
+                    dwell_hours,
+                    dormitory_boost,
+                    need,
+                    mode=mode,
+                ),
+            )
+            occupants[target_room].append(candidate)
+
+        optional = [
+            candidate
+            for candidate in pool
+            if candidate.skill.operator_name not in required_names
+        ]
+        used_names = {
+            candidate.skill.operator_name for room in occupants for candidate in room
+        }
+        # 先处理恢复率高（等级高）的宿舍：床位不够时优先把它们填满。
+        room_order = sorted(
+            range(len(specs)),
+            key=lambda index: (-specs[index].room_level, -specs[index].capacity, index),
+        )
+        states: list[tuple[float, set[str], list[list[Candidate]]]] = [
+            (
+                self._dormitory_candidate_objective(
+                    specs,
+                    occupants,
+                    dwell_hours,
+                    dormitory_boost,
+                    need,
+                    mode=mode,
+                ),
+                used_names,
+                occupants,
+            )
+        ]
+        for room_index in room_order:
+            spec = specs[room_index]
+            free_slots = spec.capacity - len(states[0][2][room_index])
+            if free_slots <= 0 or not optional:
+                continue
+            next_states: list[tuple[float, set[str], list[list[Candidate]]]] = []
+            for value, used, rooms in states:
+                available = [
+                    candidate
+                    for candidate in optional
+                    if candidate.skill.operator_name not in used
+                ]
+                if not available:
+                    next_states.append((value, used, rooms))
+                    continue
+                for fill in self._dormitory_fill_options(
+                    spec,
+                    rooms[room_index],
+                    available,
+                    free_slots,
+                    dwell_hours=dwell_hours,
+                    dormitory_boost=dormitory_boost,
+                    need=need,
+                ):
+                    fill_names = {candidate.skill.operator_name for candidate in fill}
+                    if fill_names & used:
+                        continue
+                    updated = list(rooms)
+                    updated[room_index] = [*rooms[room_index], *fill]
+                    next_states.append(
+                        (
+                            self._dormitory_candidate_objective(
+                                specs,
+                                updated,
+                                dwell_hours,
+                                dormitory_boost,
+                                need,
+                                mode=mode,
+                            ),
+                            used | fill_names,
+                            updated,
+                        )
+                    )
+            next_states.sort(key=lambda item: item[0], reverse=True)
+            states = next_states[:beam_width]
+
+        return [
+            self._dormitory_assignment(spec, operators)
+            for spec, operators in zip(specs, states[0][2])
+        ]
+
+    def _dormitory_fill_options(
+        self,
+        spec: RoomSpec,
+        base: list[Candidate],
+        available: list[Candidate],
+        free_slots: int,
+        *,
+        dwell_hours: float,
+        dormitory_boost: float,
+        need: Mapping[str, float],
+    ) -> list[list[Candidate]]:
+        """两种填法：先补缺口，或直接最大化账面恢复（beam 的分支来源）。"""
+        fills: list[list[Candidate]] = []
+        seen: set[tuple[str, ...]] = set()
+        for mode in ("deficit", "recovery"):
+            fill = self._greedy_dormitory_fill(
+                spec,
+                base,
+                available,
+                free_slots,
+                dwell_hours=dwell_hours,
+                dormitory_boost=dormitory_boost,
+                need=need,
+                mode=mode,
+            )
+            key = tuple(candidate.skill.operator_name for candidate in fill)
+            if key in seen:
+                continue
+            seen.add(key)
+            fills.append(fill)
+        return fills
+
+    def _greedy_dormitory_fill(
+        self,
+        spec: RoomSpec,
+        base: list[Candidate],
+        available: list[Candidate],
+        free_slots: int,
+        *,
+        dwell_hours: float,
+        dormitory_boost: float,
+        need: Mapping[str, float],
+        mode: str,
+    ) -> list[Candidate]:
+        chosen = list(base)
+        remaining = list(available)
+        limit = min(spec.capacity, len(base) + max(0, free_slots))
+        while len(chosen) < limit and remaining:
+            best_index = max(
+                range(len(remaining)),
+                key=lambda index: self._dormitory_insertion_key(
+                    spec,
+                    chosen,
+                    remaining[index],
+                    dwell_hours,
+                    dormitory_boost,
+                    need,
+                    mode=mode,
+                ),
+            )
+            chosen.append(remaining.pop(best_index))
+        return chosen[len(base):]
+
+    def _dormitory_insertion_key(
+        self,
+        spec: RoomSpec,
+        occupants: Sequence[Candidate],
+        candidate: Candidate,
+        dwell_hours: float,
+        dormitory_boost: float,
+        need: Mapping[str, float],
+        *,
+        mode: str,
+    ) -> tuple[Any, ...]:
+        """插入一名干员的排序键（beam 的分支来源）。
+
+        ``mode="deficit"``：先补缺口（封顶效用），总恢复次之；
+        ``mode="recovery"``：直接按账面恢复，用于探索「不封顶」的那个最优点。
+        两种填法都给 beam 提供不同的子状态，锚点偏好只做最后的并列裁决。
+        """
+        base = self._dormitory_stay_value(
+            [item.skill for item in occupants],
+            room_level=spec.room_level,
+            dwell_hours=dwell_hours,
+            dormitory_boost=dormitory_boost,
+            need=need,
+        )
+        updated = self._dormitory_stay_value(
+            [item.skill for item in [*occupants, candidate]],
+            room_level=spec.room_level,
+            dwell_hours=dwell_hours,
+            dormitory_boost=dormitory_boost,
+            need=need,
+        )
+        recovery_gain = updated[0] - base[0]
+        credit_gain = updated[1] - base[1]
+        anchor = self._dormitory_anchor_key(candidate)
+        if mode == "recovery":
+            return (recovery_gain + DORMITORY_RECOVERY_TIEBREAK * credit_gain, anchor)
+        return (credit_gain + DORMITORY_RECOVERY_TIEBREAK * recovery_gain, anchor)
+
+    def _dormitory_anchor_key(self, candidate: Candidate) -> tuple[int, int]:
+        name = candidate.skill.operator_name
+        return (
+            int(name in self.operator_anchor_preference),
+            -self.operator_anchor_rank.get(name, 1_000_000),
+        )
+
+    def _dormitory_profile(self, skill: BaseSkill) -> DormitoryRecoveryProfile:
+        key = (skill.operator_name, skill.buff_id, skill.description)
+        profile = self._dormitory_profile_cache.get(key)
+        if profile is None:
+            room_wide, own, single = dormitory_operator_bonuses(skill)
+            profile = DormitoryRecoveryProfile(
+                room_wide=room_wide,
+                own=own,
+                single=single,
+                self_contained=self_contained_recovery_rate(skill.description),
+            )
+            self._dormitory_profile_cache[key] = profile
+        return profile
+
+    def _dormitory_stay_value(
+        self,
+        operators: Sequence[BaseSkill],
+        *,
+        room_level: int,
+        dwell_hours: float,
+        dormitory_boost: float = 0.0,
+        need: Mapping[str, float] | None = None,
+    ) -> tuple[float, float]:
+        """一次宿舍停留 ``(accounted, deficit_credit)``。
+
+        ``accounted`` = 账面恢复合计，用的就是 :func:`morale.dormitory_recovery_rates`
+        的口径：白字 + 绿字 + 「该宿舍内所有干员」最大值 + 自身加成，自律节点只吃自己的
+        速率；单体技能（``某个干员``）按「本宿舍里最缺心情的舍友」近似（M1 不做逐时刻
+        追踪，但一次停留里它的**总量**总是被用满）。
+
+        ``deficit_credit`` = ``Σ min(rate × hours, need[X])``：**只把缺口补上就够**的
+        那一部分。为什么不用「账面恢复 × 权重」当目标：那会变成「谁消耗多就给谁多
+        塞床位」，而门槛要的是**每个人**的收支 ≥ 0。封顶之后，已经补满的人再住宿舍
+        对主目标没有增量，床位自然流向还没补上的人（公平性），总恢复仍由
+        ``DORMITORY_RECOVERY_TIEBREAK`` 当并列时的次级目标。
+        """
+        need = need or {}
+        operators = list(operators)
+        if not operators or dwell_hours <= 0.0:
+            return 0.0, 0.0
+        passive = dormitory_passive_recovery_rate(room_level) + dormitory_boost
+        profiles = [self._dormitory_profile(skill) for skill in operators]
+        room_wide = max(profile.room_wide for profile in profiles)
+        rates: list[float] = []
+        for profile in profiles:
+            if profile.self_contained is not None:
+                rates.append(profile.self_contained)
+            else:
+                rates.append(passive + room_wide + profile.own)
+        accounted = sum(rates)
+        credit = sum(
+            min(rate * dwell_hours, need.get(skill.operator_name, 0.0))
+            for skill, rate in zip(operators, rates)
+        )
+        single_bonus = 0.0
+        single_owner = -1
+        for index, profile in enumerate(profiles):
+            if profile.single is not None and profile.single > single_bonus:
+                single_bonus = profile.single
+                single_owner = index
+        if single_bonus > 0.0:
+            targets = [
+                index
+                for index, profile in enumerate(profiles)
+                if index != single_owner and profile.self_contained is None
+            ]
+            if targets:
+                target = max(
+                    targets,
+                    key=lambda index: (
+                        need.get(operators[index].operator_name, 0.0),
+                        rates[index],
+                        -index,
+                    ),
+                )
+                accounted += single_bonus
+                credit += min(
+                    single_bonus * dwell_hours,
+                    max(
+                        0.0,
+                        need.get(operators[target].operator_name, 0.0)
+                        - rates[target] * dwell_hours,
+                    ),
+                )
+        return accounted * dwell_hours, credit
+
+    def _dormitory_objective_value(
+        self,
+        specs: Sequence[RoomSpec],
+        rooms: Sequence[Sequence[BaseSkill]],
+        dwell_hours: float,
+        dormitory_boost: float,
+        need: Mapping[str, float],
+        *,
+        mode: str = "deficit",
+    ) -> float:
+        """宿舍分配目标：``deficit`` 先补缺口，``recovery`` 先最大化账面恢复。"""
+        total = 0.0
+        for spec, operators in zip(specs, rooms):
+            accounted, credit = self._dormitory_stay_value(
+                operators,
+                room_level=spec.room_level,
+                dwell_hours=dwell_hours,
+                dormitory_boost=dormitory_boost,
+                need=need,
+            )
+            if mode == "recovery":
+                total += accounted + DORMITORY_RECOVERY_TIEBREAK * credit
+            else:
+                total += credit + DORMITORY_RECOVERY_TIEBREAK * accounted
+        return total
+
+    def _dormitory_candidate_objective(
+        self,
+        specs: Sequence[RoomSpec],
+        occupants: Sequence[Sequence[Candidate]],
+        dwell_hours: float,
+        dormitory_boost: float,
+        need: Mapping[str, float],
+        *,
+        mode: str = "deficit",
+    ) -> float:
+        return self._dormitory_objective_value(
+            specs,
+            [[candidate.skill for candidate in room] for room in occupants],
+            dwell_hours,
+            dormitory_boost,
+            need,
+            mode=mode,
+        )
+
+    def _dormitory_assignment(
+        self,
+        spec: RoomSpec,
+        candidates: Sequence[Candidate],
+    ) -> RoomAssignment:
+        return RoomAssignment(
+            room_id=spec.room_id,
+            room_type=spec.room_type,
+            room_name=ROOM_NAMES.get(spec.room_type, spec.room_type),
+            target=spec.target,
+            operators=[candidate.skill for candidate in candidates],
+            score=round(sum(candidate.score for candidate in candidates), 3),
+            room_level=spec.room_level,
+            slots=spec.capacity,
+        )
 
     def _dorm_candidate(self, name: str) -> Candidate | None:
         operator = self.roster_by_name.get(name)
@@ -2889,10 +3601,23 @@ class ScheduleOptimizer:
         specs.append(RoomSpec("hire_1", "HIRE", None, self._room_capacity("HIRE")))
         return specs
 
-    def _dorm_specs(self, layout: Layout) -> list[tuple[str, str, None, int]]:
+    def _dorm_specs(self, layout: Layout) -> list[RoomSpec]:
+        """宿舍规格（M1）：容量 5，等级取 ``layout.dormitory_levels``。
+
+        等级必须和心情审计用**同一套**解析（``levels_or_default(..., 5)``），
+        否则 beam 会按 4.0/h 定价、审计却按 2.0/h 记账。
+        """
         capacity = self._room_capacity("DORMITORY")
+        levels = levels_or_default(layout.dormitory_levels, layout.dormitory, 5)
         return [
-            (f"dormitory_{index}", "DORMITORY", None, capacity)
+            RoomSpec(
+                f"dormitory_{index}",
+                "DORMITORY",
+                None,
+                capacity,
+                levels[index - 1],
+                capacity,
+            )
             for index in range(1, layout.dormitory + 1)
         ]
 
@@ -3610,6 +4335,20 @@ def shift_label(index: int) -> str:
     if index < len(alphabet):
         return alphabet[index]
     return f"S{index + 1}"
+
+
+def dormitory_plan_signature(shifts: Sequence[ShiftPlan]) -> tuple[Any, ...]:
+    """一条排班的宿舍分配指纹（用来给候选去重；房间与班次顺序都算在内）。"""
+    return tuple(
+        (
+            shift.name,
+            tuple(
+                (room.room_id, tuple(skill.operator_name for skill in room.operators))
+                for room in shift.dormitories
+            ),
+        )
+        for shift in shifts
+    )
 
 
 def repeat_shift_cycle(shifts: list[ShiftPlan], repeat_count: int) -> list[ShiftPlan]:

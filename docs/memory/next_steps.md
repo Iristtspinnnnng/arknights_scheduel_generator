@@ -1171,7 +1171,63 @@ in `normal` mode that room dominates the difference and the shortlist is effecti
 the hybrid's exhaustive enumeration happens to land on better ties. Closing it needs the joint
 room/dormitory decode (handoff step 4), not a wider shortlist (already measured: widening makes it worse).
 
+**Correction (after P15):** the "joint room/dormitory decode will close the `normal` gap" guess is
+**falsified**. Dormitories were made a first-class allocation target (P15) and both benchmark tables
+reproduced bit for bit; the 16-cell scan's worst balances did not move at all. The full-roster morale
+gate already has +4.0 headroom, so dormitory allocation cannot change who works, hence cannot move the
+production score. The `normal` gap must come from the shortlist/tie ordering (items 2/4/5 in
+`docs/graph_optimizer.md` 6), not from dormitories.
+
 Note for future benchmark runs: the report's `graphConflicts` / `hybridConflicts` count
 `boundary:<shift>:...` records, i.e. operators working two consecutive shifts (the normal rotation
 shape), 4 per case for both algorithms. They are not same-shift conflicts.
+
+
+## P15 - M1: Dormitory as a First-Class Allocation Target
+
+Status: done. Dormitories used to be filled by a greedy pass after the production rooms were chosen
+(`_assign_dormitories` looked at "who is off duty" plus anchor preference, never at who *needs* the
+recovery). M1 makes dormitory assignment a beam search judged by the morale audit itself.
+
+Where it lives (deviation from handoff step 4, on purpose): **not** in `_assign_work_rooms_jointly`.
+Beds are a cross-shift resource (243 = 4 rooms x 5 beds vs 29 on duty), and `_rebuild_dormitories` runs
+hundreds of times per `optimize()` inside the insertion/replacement searches. Putting the beam there
+measured 17.7s -> 107.6s (6x wall) for a bit-identical final schedule, because dormitories do not enter
+the production score. So the decode keeps the cheap greedy and the beam runs once, in
+`_ensure_sustainable_morale_cycle`.
+
+Mechanics:
+
+- `morale.py` gained the shared rate/accounting entry points
+  (`dormitory_operator_bonuses`, `dormitory_recovery_rates`, `dormitory_single_target`,
+  `control_dormitory_boost`, `morale_consumption_by_operator`); `dormitory_recovery_bonuses` and
+  `_recover_dormitory_room` now call them, so the beam and the audit cannot drift apart.
+- `_dorm_specs()` returns `RoomSpec` with `room_level = levels_or_default(layout.dormitory_levels, ...)`.
+- `_dormitory_stay_value` = `(accounted, deficit_credit)`: accounted recovery (same rates as the audit)
+  and `sum(min(rate * hours, need))`, i.e. only the part that closes each operator's deficit.
+- `_assign_dormitory_quarters` produces three candidates - `deficit` beam, `recovery` beam, and the
+  old greedy - and picks by the audit's own `(hardGatePassed, worst balance, total recovery)`.
+  The old greedy is one of the candidates, so M1 **cannot** book less than the baseline.
+
+Measured (full-roster fixture):
+
+| check | result |
+| --- | --- |
+| `pytest tests -q` | 262 passed / 1 skipped / 1 known env fail (8 new dormitory tests) |
+| 16-cell feasibility scan | 16/16 pass, worst balance +4.0 (identical to before), max abs score delta 0.0 |
+| total recovery, per cell | never lower; 7/16 cells higher (+1.1 .. +12.1 morale/cycle) |
+| 4-scenario benchmark | both columns bit-identical to handoff 5; shortlist 5/5, top16 recall 1.0 |
+| 252/342 benchmark | bit-identical (2W/2L, mean ratio 1.000938) |
+| wall clock | +0.4% .. +1.5% per case (isolated) |
+| `generate` 243/333/342 | exit 0, cycleHours 144/48/48, gate passed |
+
+Traps worth remembering:
+- Single-objective (maximise total recovery) **lowers the worst balance** on the tight 2x12 cells
+  (7.2 -> 6.0) while raising the total. Single-objective (deficit only) loses the room-wide bonus
+  synergy in the 3x8 cells (-4 .. -19 total). Hence the three-candidate portfolio + audit verdict.
+- `_dormitory_stay_value` and `audit_morale_cycle` must stay on the same rate functions; the test
+  `test_dormitory_stay_value_matches_the_morale_audit_ledger` is the anti-drift lock.
+- The staggering expansion still triggers (29 on duty > 20 beds is structural). M1 does not and cannot
+  remove it; that is handoff step 3 (rotation table).
+
 

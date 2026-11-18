@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
@@ -13,7 +14,10 @@ from arknights_schedule_generator.models import (
     ShiftPlan,
     UpgradeRequirement,
 )
-from arknights_schedule_generator.morale import audit_morale_cycle
+from arknights_schedule_generator.morale import (
+    audit_morale_cycle,
+    dormitory_passive_recovery_rate,
+)
 from arknights_schedule_generator.optimizer import (
     COMBO_CANDIDATE_POOL_LIMIT,
     RoomCombo,
@@ -213,7 +217,7 @@ class OptimizerTest(unittest.TestCase):
         optimizer.operator_anchor_rank = {"参考锚点": 0, "参考锚点靠后": 1}
 
         dormitories = optimizer._assign_dormitories(
-            [("dormitory_1", "DORMITORY", None, 1)],
+            [RoomSpec("dormitory_1", "DORMITORY", None, 1)],
             active_names=set(),
             rest_priority=["普通休息甲"],
         )
@@ -222,7 +226,7 @@ class OptimizerTest(unittest.TestCase):
 
         visible_anchor_names = {"参考锚点"}
         next_dormitories = optimizer._assign_dormitories(
-            [("dormitory_1", "DORMITORY", None, 1)],
+            [RoomSpec("dormitory_1", "DORMITORY", None, 1)],
             active_names=set(),
             rest_priority=["普通休息甲"],
             visible_anchor_names=visible_anchor_names,
@@ -2293,6 +2297,569 @@ class OptimizerTest(unittest.TestCase):
 
         self.assertIsNone(blocked)
         self.assertIsNotNone(alternate)
+
+
+DORM_ALL_BONUS_TEXT = "进驻宿舍时，该宿舍内所有干员的心情每小时恢复+{bonus}"
+DORM_SELF_TEXT = "进驻宿舍时，自身心情每小时恢复+{bonus}"
+DORM_SINGLE_TEXT = "进驻宿舍时，该宿舍内除自身以外心情未满的某个干员每小时恢复+{bonus}"
+DORM_SELF_CONTAINED_TEXT = (
+    "进驻宿舍时，自身心情每小时恢复+2，且无法获得其他来源提供的心情恢复效果"
+)
+
+
+class DormitoryFirstClassAssignmentTest(unittest.TestCase):
+    """M1：宿舍成为解码的一等目标（beam 分配），而不是事后贪心补位。
+
+    这一组测试锁住四件事：
+
+    1. 结构约束：每班次上床位数 ≤ 房间容量、同一人不能同时在岗与休息、跨宿舍不重复；
+    2. 质量：宿舍 beam 的**账面恢复**不低于现有贪心（用 ``morale`` 的 ledger 对比）；
+    3. 口径隔离：宿舍分配**不进**产能分，``result.score`` 不受影响；
+    4. 硬门槛：``_ensure_sustainable_morale_cycle`` 在 M1 输出上仍然通过。
+    """
+
+    def test_dormitory_specs_follow_layout_levels(self) -> None:
+        optimizer = optimizer_with_skills([])
+
+        specs = optimizer._dorm_specs(parse_layout("243"))
+        self.assertEqual(
+            [spec.room_id for spec in specs],
+            ["dormitory_1", "dormitory_2", "dormitory_3", "dormitory_4"],
+        )
+        self.assertTrue(all(spec.room_type == "DORMITORY" for spec in specs))
+        self.assertTrue(all(spec.target is None for spec in specs))
+        self.assertEqual([spec.capacity for spec in specs], [5, 5, 5, 5])
+        # 没有显式等级时与心情审计一致：按 5 级（4.0/h）计。
+        self.assertEqual([spec.room_level for spec in specs], [5, 5, 5, 5])
+
+        adjusted = replace(parse_layout("252"), dormitory_levels=(1, 1, 1, 2))
+        adjusted_specs = optimizer._dorm_specs(adjusted)
+        self.assertEqual(
+            [spec.room_level for spec in adjusted_specs],
+            [1, 1, 1, 2],
+        )
+
+    def test_dormitory_quarters_respect_capacity_and_rest_exclusivity(self) -> None:
+        names = [f"OP{index}" for index in range(32)]
+        skills = {name: work_skill(name) for name in names}
+        optimizer = optimizer_with_skills(list(skills.values()))
+        active_a = names[:20]
+        active_b = names[12:]
+        shifts = shifts_from_active([active_a, active_b], skills)
+
+        assigned = optimizer._assign_dormitory_quarters(parse_layout("243"), shifts)
+
+        self.assertEqual(len(assigned), 2)
+        for shift, active in zip(assigned, (set(active_a), set(active_b))):
+            self.assertEqual(len(shift.dormitories), 4)
+            resting: set[str] = set()
+            for dormitory in shift.dormitories:
+                occupants = [skill.operator_name for skill in dormitory.operators]
+                self.assertLessEqual(len(occupants), 5)
+                self.assertEqual(len(occupants), len(set(occupants)))
+                self.assertFalse(set(occupants) & active)
+                self.assertFalse(set(occupants) & resting)
+                resting.update(occupants)
+            # 离岗 12 人 < 20 床，所以每个离岗的人都应该拿到床位。
+            self.assertEqual(resting, set(names) - active)
+
+    def test_dormitory_quarters_book_at_least_the_greedy_recovery(self) -> None:
+        names = [f"OP{index}" for index in range(30)]
+        skills: dict[str, BaseSkill] = {
+            name: dorm_skill(name, DORM_SELF_TEXT.format(bonus="0.7"), parsed_score=5.0)
+            for name in names
+        }
+        # 全员加成持有者：工种分 0，旧贪心按工种分排序时会被挤出床位。
+        skills["全体加成"] = dorm_skill(
+            "全体加成",
+            DORM_ALL_BONUS_TEXT.format(bonus="0.3"),
+            parsed_score=0.0,
+        )
+        optimizer = optimizer_with_skills(list(skills.values()))
+        active_a = names[:10]
+        active_b = names[10:20]
+        layout = parse_layout("243")
+        base = shifts_from_active([active_a, active_b], skills)
+        specs = optimizer._dorm_specs(layout)
+        active_by_shift = [set(active_a), set(active_b)]
+        greedy = [
+            replace(
+                shift,
+                dormitories=optimizer._assign_dormitories(
+                    specs,
+                    active_by_shift[index],
+                    optimizer._rest_priority(active_by_shift, index),
+                ),
+            )
+            for index, shift in enumerate(base)
+        ]
+
+        assigned = optimizer._assign_dormitory_quarters(layout, base)
+
+        beacon = "全体加成"
+        self.assertIn(beacon, sleeping_names(assigned))
+        greedy_accounted = dormitory_accounted_recovery(layout, greedy)
+        assigned_accounted = dormitory_accounted_recovery(layout, assigned)
+        self.assertGreaterEqual(assigned_accounted, greedy_accounted - 1e-6)
+        self.assertGreater(assigned_accounted, greedy_accounted)
+        self.assertGreaterEqual(
+            ledger_recovery_total(layout, assigned),
+            ledger_recovery_total(layout, greedy) - 1e-6,
+        )
+        self.assertGreater(
+            ledger_recovery_total(layout, assigned),
+            ledger_recovery_total(layout, greedy),
+        )
+
+    def test_dormitory_stay_value_counts_room_wide_bonus_once(self) -> None:
+        weak = dorm_skill("弱加成", DORM_ALL_BONUS_TEXT.format(bonus="0.2"))
+        strong = dorm_skill("强加成", DORM_ALL_BONUS_TEXT.format(bonus="0.3"))
+        plain = dorm_skill("普通", "")
+        optimizer = optimizer_with_skills([weak, strong, plain])
+
+        accounted, weighted = optimizer._dormitory_stay_value(
+            [weak, strong, plain],
+            room_level=5,
+            dwell_hours=12.0,
+            need={},
+        )
+
+        expected_rate = 3 * (dormitory_passive_recovery_rate(5) + 0.3)
+        self.assertAlmostEqual(accounted, expected_rate * 12.0, places=9)
+        self.assertAlmostEqual(weighted, 0.0, places=9)
+
+    def test_dormitory_stay_value_keeps_self_contained_operator_isolated(self) -> None:
+        fiammetta = dorm_skill("菲亚梅塔", DORM_SELF_CONTAINED_TEXT)
+        booster = dorm_skill("全体加成", DORM_ALL_BONUS_TEXT.format(bonus="0.5"))
+        optimizer = optimizer_with_skills([fiammetta, booster])
+
+        accounted, _ = optimizer._dormitory_stay_value(
+            [fiammetta, booster],
+            room_level=5,
+            dwell_hours=6.0,
+            dormitory_boost=0.4,
+            need={},
+        )
+
+        # 自律节点只吃自己的 +2/h；同宿舍的群体加成与控制中枢宿舍加成都不叠加。
+        booster_rate = dormitory_passive_recovery_rate(5) + 0.4 + 0.5
+        self.assertAlmostEqual(accounted, (2.0 + booster_rate) * 6.0, places=9)
+
+    def test_dormitory_quarters_place_required_rest_even_when_value_is_low(self) -> None:
+        names = [f"OP{index}" for index in range(40)]
+        skills: dict[str, BaseSkill] = {}
+        for index, name in enumerate(names):
+            # 39/40 号没有任何宿舍加成，其余人都带 +0.5 全员加成；
+            # 床位只有 20 张、离岗 30 人，按价值选人时他们两个一定被挤掉。
+            skills[name] = (
+                dorm_skill(name, "")
+                if index >= 38
+                else dorm_skill(
+                    name,
+                    DORM_ALL_BONUS_TEXT.format(bonus="0.5"),
+                    parsed_score=1.0,
+                )
+            )
+        optimizer = optimizer_with_skills(list(skills.values()))
+        layout = parse_layout("243")
+        shifts = shifts_from_active([names[:10]], skills, room_size=2)
+
+        assigned = optimizer._assign_dormitory_quarters(
+            layout,
+            shifts,
+            required_rest=[{"OP38", "OP39"}],
+        )
+
+        self.assertTrue({"OP38", "OP39"} <= sleeping_names(assigned))
+        self.assertEqual(
+            len(sleeping_names(assigned)),
+            20,
+            "20 张床应被用满，必休的人不能因为价值低被跳过",
+        )
+
+    def test_dormitory_quarters_never_book_less_than_the_greedy_baseline(self) -> None:
+        names = [f"OP{index}" for index in range(40)]
+        skills: dict[str, BaseSkill] = {}
+        for index, name in enumerate(names):
+            skills[name] = (
+                dorm_skill(
+                    name,
+                    DORM_ALL_BONUS_TEXT.format(bonus="0.35"),
+                    parsed_score=2.0,
+                )
+                if index % 3 == 0
+                else dorm_skill(name, DORM_SELF_TEXT.format(bonus="0.2"))
+            )
+        optimizer = optimizer_with_skills(list(skills.values()))
+        # 2 发电站的宿舍等级：恢复率只有 2.0~2.5/h，也是 16 组扫描里最紧凑的 252 形态。
+        layout = replace(parse_layout("252"), dormitory_levels=(1, 1, 1, 2))
+        active_a = names[:10]
+        active_b = names[10:20]
+        base = shifts_from_active([active_a, active_b], skills, room_size=2)
+        specs = optimizer._dorm_specs(layout)
+        active_by_shift = [set(active_a), set(active_b)]
+        greedy = [
+            replace(
+                shift,
+                dormitories=optimizer._assign_dormitories(
+                    specs,
+                    active_by_shift[index],
+                    optimizer._rest_priority(active_by_shift, index),
+                ),
+            )
+            for index, shift in enumerate(base)
+        ]
+
+        assigned = optimizer._assign_dormitory_quarters(layout, base)
+
+        chosen_total, chosen_worst = dormitory_ledger_summary(layout, assigned)
+        greedy_total, greedy_worst = dormitory_ledger_summary(layout, greedy)
+        self.assertGreaterEqual(chosen_worst, greedy_worst - 1e-6)
+        self.assertGreaterEqual(chosen_total, greedy_total - 1e-6)
+        # 跨班次可以重复住，但每个班次都必须把 20 张床用满。
+        for shift in assigned:
+            self.assertEqual(sum(len(room.operators) for room in shift.dormitories), 20)
+
+    def test_dormitory_plan_key_prefers_worst_balance_then_total_recovery(self) -> None:
+        heavy = optimizer_skill(
+            "Heavy",
+            "MANUFACTURE",
+            "heavy",
+            10,
+            description="进驻制造站时，心情每小时消耗+0.5",
+        )
+        light = dorm_skill("Light", "")
+        third = dorm_skill("Third", "")
+        spare = dorm_skill("Spare", "")
+        a1 = optimizer_skill("A1", "MANUFACTURE", "a_side", 10)
+        optimizer = optimizer_with_skills([heavy, light, third, spare, a1])
+        layout = replace(parse_layout("243"), dormitory_levels=(5, 1, 1, 1))
+
+        def build(
+            second_shift_high: BaseSkill,
+            second_shift_low: BaseSkill,
+            *,
+            with_spare: bool = False,
+        ) -> list[ShiftPlan]:
+            # 班次 A 在岗 Heavy、班次 B 在岗 A1，所以 A 的宿舍必须包含 A1、
+            # B 的宿舍必须包含 Heavy（错峰展开的硬约束）。
+            first_dorms = [
+                make_test_room("dormitory_1", "DORMITORY", None, [a1], slots=1),
+                make_test_room("dormitory_2", "DORMITORY", None, [light], slots=1),
+            ]
+            second_dorms = [
+                make_test_room(
+                    "dormitory_1",
+                    "DORMITORY",
+                    None,
+                    [second_shift_high],
+                    slots=1,
+                ),
+                make_test_room(
+                    "dormitory_2",
+                    "DORMITORY",
+                    None,
+                    [second_shift_low],
+                    slots=1,
+                ),
+            ]
+            if with_spare:
+                for dorms in (first_dorms, second_dorms):
+                    dorms.append(
+                        make_test_room("dormitory_3", "DORMITORY", None, [spare], slots=1)
+                    )
+            return [
+                ShiftPlan(
+                    "A",
+                    "08:00",
+                    12,
+                    [make_test_room("manufacture_1", "MANUFACTURE", "F_EXP", [heavy])],
+                    first_dorms,
+                ),
+                ShiftPlan(
+                    "B",
+                    "20:00",
+                    12,
+                    [make_test_room("manufacture_1", "MANUFACTURE", "F_EXP", [a1])],
+                    second_dorms,
+                ),
+            ]
+
+        # 两种排法总恢复相同（每班一张 L5 + 一张 L1 = 144），但 Heavy 消耗 1.5/h，
+        # 必须优先拿到 5 级宿舍，否则最差收支从 24 掉到 6。
+        heavy_in_level_one = build(third, heavy)
+        heavy_in_level_five = build(heavy, third)
+        chosen = optimizer._select_dormitory_plan(
+            layout,
+            [heavy_in_level_one, heavy_in_level_five],
+        )
+        self.assertIs(chosen, heavy_in_level_five)
+        self.assertEqual(
+            optimizer._dormitory_plan_key(layout, heavy_in_level_five)[1],
+            24.0,
+        )
+        self.assertEqual(
+            optimizer._dormitory_plan_key(layout, heavy_in_level_one)[1],
+            6.0,
+        )
+
+        # 最差收支打平时，总恢复更高的那份胜出（多住一个人不伤任何人）。
+        with_spare = build(heavy, third, with_spare=True)
+        chosen_with_spare = optimizer._select_dormitory_plan(
+            layout,
+            [heavy_in_level_five, with_spare],
+        )
+        self.assertIs(chosen_with_spare, with_spare)
+
+    def test_dormitory_stay_value_matches_the_morale_audit_ledger(self) -> None:
+        boosters = [
+            dorm_skill("全体甲", DORM_ALL_BONUS_TEXT.format(bonus="0.15")),
+            dorm_skill("自身乙", DORM_SELF_TEXT.format(bonus="0.7")),
+            dorm_skill("普通丙", ""),
+            dorm_skill("普通丁", ""),
+            dorm_skill("普通戊", ""),
+            dorm_skill("普通己", ""),
+        ]
+        optimizer = optimizer_with_skills(boosters)
+        layout = parse_layout("243")
+        dorms = [
+            make_test_room("dormitory_1", "DORMITORY", None, boosters[:3], room_level=5, slots=5),
+            make_test_room("dormitory_2", "DORMITORY", None, boosters[3:], room_level=5, slots=5),
+        ]
+        shifts = [ShiftPlan("S0", "08:00", 12, [], dorms)]
+
+        accounted = sum(
+            optimizer._dormitory_stay_value(
+                room.operators,
+                room_level=5,
+                dwell_hours=12.0,
+                need={},
+            )[0]
+            for room in dorms
+        )
+        ledger = audit_morale_cycle(layout, shifts)["moraleLedgerByOperator"]
+        booked = sum(item["recovery"] for item in ledger.values())
+
+        self.assertAlmostEqual(accounted, booked, places=6)
+
+    def test_dormitory_quarters_leave_production_scoring_untouched(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_minimal_data(data_dir)
+            game_data = GameData.load(data_dir)
+            roster = [
+                RosterOperator("能天使", True, 6, 1, 0),
+                RosterOperator("德克萨斯", True, 5, 1, 2),
+                RosterOperator("空", True, 5, 1, 0),
+                RosterOperator("史都华德", True, 3, 30, 0),
+                RosterOperator("夜刀", True, 2, 30, 0),
+                RosterOperator("Lancet-2", True, 1, 30, 0),
+                RosterOperator("Castle-3", True, 1, 30, 0),
+                RosterOperator("巡林者", True, 2, 30, 0),
+                RosterOperator("杜林", True, 2, 30, 0),
+                RosterOperator("安德切尔", True, 3, 30, 0),
+                RosterOperator("米格鲁", True, 3, 30, 0),
+                RosterOperator("克洛丝", True, 3, 30, 0),
+                RosterOperator("芬", True, 3, 30, 0),
+                RosterOperator("翎羽", True, 3, 30, 0),
+                RosterOperator("香草", True, 3, 30, 0),
+                RosterOperator("玫兰莎", True, 3, 30, 0),
+            ]
+            optimizer = ScheduleOptimizer(
+                game_data,
+                roster,
+                allow_upgrades=True,
+                upgrade_cost_weight=0,
+            )
+            layout = parse_layout("243")
+            result = optimizer.optimize(layout, shift_count=2)
+            base_shifts, _ = optimizer._build_shifts(
+                layout,
+                optimizer._room_specs(layout, "normal"),
+                shift_durations=[12.0, 12.0],
+                shift_times=["08:00", "20:00"],
+            )
+            reassigned = optimizer._assign_dormitory_quarters(layout, base_shifts)
+
+        simulator = ProductionSimulator(game_data)
+        without_dormitories = [replace(shift, dormitories=[]) for shift in result.shifts]
+        self.assertAlmostEqual(
+            simulator.evaluate(without_dormitories).score,
+            result.score,
+            places=6,
+        )
+        self.assertGreater(
+            sum(len(shift.dormitories) for shift in result.shifts),
+            0,
+        )
+        self.assertEqual(
+            rooms_signature(reassigned),
+            rooms_signature(base_shifts),
+        )
+
+    def test_morale_gate_passes_on_dormitory_beam_output(self) -> None:
+        names = [f"A{index}" for index in range(29)] + [
+            f"B{index}" for index in range(29)
+        ]
+        skills = {
+            name: optimizer_skill(name, "MANUFACTURE", "fixture", 10)
+            for name in names
+        }
+        optimizer = optimizer_with_skills(list(skills.values()))
+        layout = parse_layout("243")
+        base_shifts = [
+            shift_with_rooms(prefix, rotation_rooms(skills, prefix))
+            for prefix in ("A", "B")
+        ]
+
+        assigned = optimizer._assign_dormitory_quarters(layout, base_shifts)
+        expanded, audit = optimizer._ensure_sustainable_morale_cycle(layout, assigned)
+
+        self.assertTrue(audit["hardGatePassed"], audit["failureReasons"])
+        self.assertEqual(audit["basePlanCount"], 2)
+        self.assertGreater(len(expanded), 2)
+        # 错峰展开后「离岗的人」全部在宿舍里，且不超过 4 间 × 5 床。
+        self.assertLessEqual(
+            max(item["outgoingCount"] for item in audit["transitions"]),
+            20,
+        )
+        self.assertEqual(
+            [item["missingRestOperators"] for item in audit["transitions"]],
+            [[] for _ in audit["transitions"]],
+        )
+        final = audit_morale_cycle(layout, expanded)
+        self.assertTrue(final["hardGatePassed"], final["failureReasons"])
+        self.assertTrue(
+            all(
+                balance >= -1e-6
+                for balance in (
+                    item["balance"] for item in final["moraleLedgerByOperator"].values()
+                )
+            )
+        )
+
+
+def dorm_skill(name: str, description: str, *, parsed_score: float = 0.0) -> BaseSkill:
+    return optimizer_skill(
+        name,
+        "DORMITORY",
+        f"dorm_{name}",
+        parsed_score,
+        description=description,
+    )
+
+
+def work_skill(name: str, *, parsed_score: float = 10.0) -> BaseSkill:
+    return optimizer_skill(name, "MANUFACTURE", f"work_{name}", parsed_score)
+
+
+def shifts_from_active(
+    active_groups: list[list[str]],
+    skills: dict[str, BaseSkill],
+    *,
+    hours: float = 12.0,
+    room_size: int = 3,
+) -> list[ShiftPlan]:
+    shifts: list[ShiftPlan] = []
+    for index, names in enumerate(active_groups):
+        rooms: list[RoomAssignment] = []
+        for room_index, start in enumerate(range(0, len(names), room_size), 1):
+            chunk = [skills[name] for name in names[start : start + room_size]]
+            rooms.append(
+                RoomAssignment(
+                    f"manufacture_{room_index}",
+                    "MANUFACTURE",
+                    "制造站",
+                    "F_EXP",
+                    chunk,
+                    float(len(chunk)),
+                    slots=len(chunk),
+                )
+            )
+        shifts.append(
+            ShiftPlan(f"S{index}", f"{8 + int(hours) * index:02d}:00", hours, rooms, [])
+        )
+    return shifts
+
+
+def rotation_rooms(skills: dict[str, BaseSkill], prefix: str) -> list[RoomAssignment]:
+    rooms: list[RoomAssignment] = []
+    offset = 0
+    for room_index, size in enumerate([3] * 9 + [2], 1):
+        operators = [
+            skills[f"{prefix}{index}"] for index in range(offset, offset + size)
+        ]
+        offset += size
+        rooms.append(
+            RoomAssignment(
+                f"manufacture_{room_index}",
+                "MANUFACTURE",
+                "制造站",
+                "F_EXP",
+                operators,
+                30.0,
+                slots=size,
+            )
+        )
+    return rooms
+
+
+def sleeping_names(shifts: list[ShiftPlan]) -> set[str]:
+    return {
+        skill.operator_name
+        for shift in shifts
+        for room in shift.dormitories
+        for skill in room.operators
+    }
+
+
+def rooms_signature(shifts: list[ShiftPlan]) -> list[list[tuple[str, tuple[str, ...]]]]:
+    return [
+        [
+            (room.room_id, tuple(skill.operator_name for skill in room.operators))
+            for room in shift.rooms
+        ]
+        for shift in shifts
+    ]
+
+
+def dormitory_accounted_recovery(layout, shifts: list[ShiftPlan]) -> float:
+    """Recompute the booked dormitory recovery with the audit's own rate functions."""
+    from arknights_schedule_generator.morale import (
+        control_dormitory_boost,
+        dormitory_recovery_rates,
+        dormitory_single_target,
+    )
+
+    total = 0.0
+    for shift in shifts:
+        boost = control_dormitory_boost(shift)
+        for index, room in enumerate(shift.dormitories):
+            level = layout.dormitory_levels[index] if index < len(layout.dormitory_levels) else 5
+            passive = dormitory_passive_recovery_rate(level) + boost
+            rates = dormitory_recovery_rates(room, passive)
+            accounted = sum(rates.values())
+            single = dormitory_single_target(room)
+            if single is not None:
+                bonus, owner = single
+                if [name for name in rates if name != owner]:
+                    accounted += bonus
+            total += accounted * float(shift.duration_hours)
+    return total
+
+
+def ledger_recovery_total(layout, shifts: list[ShiftPlan]) -> float:
+    audit = audit_morale_cycle(layout, shifts)
+    return sum(item["recovery"] for item in audit["moraleLedgerByOperator"].values())
+
+
+def dormitory_ledger_summary(layout, shifts: list[ShiftPlan]) -> tuple[float, float]:
+    """``(总恢复, 最差收支)``，直接取心情审计的账本。"""
+    ledger = audit_morale_cycle(layout, shifts)["moraleLedgerByOperator"]
+    return (
+        sum(item["recovery"] for item in ledger.values()),
+        min(item["balance"] for item in ledger.values()),
+    )
 
 
 def shift_has_operator(result, room_type: str, target: str | None, operator_name: str) -> bool:

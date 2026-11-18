@@ -1,34 +1,40 @@
 # 接手文档：图卷积优化器 + 心情/宿舍模型
 
 > 写于上下文耗尽前。下一个窗口从这里开始，不必回读聊天记录。
-> 最后更新：第 1、2 步 + 单体宿舍恢复 + 菲亚梅塔（自给自足节点）+ 252/342 基准都已完成；
-> **下一个窗口从 §3 第 4 步（宿舍做成一等分配目标）开始**，计划、落点、验收标准都写在那一节。
+> 最后更新：第 1、2 步 + 单体宿舍恢复 + 菲亚梅塔（自给自足节点）+ 252/342 基准 +
+> **第 4 步 M1（宿舍做成一等分配目标）都已完成**。
+> **下一个窗口从 §3 第 5 步（办公室选人）或第 3 步（错峰轮转表）开始** —— 两步的现状与落点
+> 都写在 §3；M1 的实测结论见 §3 第 4 步开头与 §5。
 
 ---
 
 ## 0. 一分钟速览
 
-- 分支 `main`，**领先 `origin/main` 7 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
+- 分支 `main`，**领先 `origin/main` 8 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
   `c2d39ba`（社区打分权重 + 显式羁绊 + numpy + 缓存 + 多起手）、
   `d78daad`（心情审计改成收支记账 + 老的基准容错/循环上限）、
   `9e1b605`（宿舍绿字 + 作用域减耗 + 控制中枢 + 父类纯赤金 7 天上限），
-  以及最后三个「单体宿舍恢复的锁定语义」「菲亚梅塔＝自给自足特殊节点」「252/342 基准记录」
-  （`git log` 可见，内容见 §2.2 第 4、5 条与 §5）。
-- **§3 第 1、2 步已完成**：
+  三个「单体宿舍恢复的锁定语义」「菲亚梅塔＝自给自足特殊节点」「252/342 基准记录」，
+  以及最新的「M1：宿舍一等分配」（`git log` 可见，内容见 §3 第 4 步与 §5）。
+- **§3 第 1、2、4 步已完成**：
   - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 现在是 `version: 3`）；
   - 宿舍补上绿字（`0.0004 × 氛围`）、在岗减耗按作用域解析、控制中枢 −0.05/h × 在岗人数；
   - 单体宿舍恢复（`dorm_rec_single`，26 条）按「锁定最低心情舍友直到回满」的语义启用；
   - 菲亚梅塔「自律」按「恢复自给自足的特殊节点」建模（图侧只标注、不加特征）；
-  - **252/342 现在全部可行**（16/16 组合通过，最差收支 +4.0）。
+  - **252/342 现在全部可行**（16/16 组合通过，最差收支 +4.0）；
+  - **宿舍是一等分配目标（M1）**：整条排班一次 beam（两套目标）+ 旧贪心三候选，
+    用心情审计自己的账本 `(门槛, 最差收支, 总恢复)` 择优。产能分一格没动，
+    总恢复在 7/16 组合上变好，最差收支一格没变差。
   细节见 §2、§3、§4。
 - 安全备份分支：`backup/pre-rebase-graph`（rebase 前的原始状态）。
-- 测试：**254 passed / 1 skipped / 1 failed**（含 `tests/test_morale.py` 24 个、纯赤金 7 天上限 1 个、图标注 1 个）。唯一失败是既有环境问题
+- 测试：**262 passed / 1 skipped / 1 failed**（新增 `DormitoryFirstClassAssignmentTest` 8 个）。
+  唯一失败是既有环境问题
   （`test_calibration_report_examples_pass` 需要仓库外的 `C:\tmp\yituliu_schedule_images_current.js`，
   报 `missing_local_asset`），与本项目改动无关，不要去"修"它。
 - 环境：系统 `python`（WindowsApps，3.13）**没有 pytest**，不能直接跑测试；本轮实际用的是 DSH 自带的
   Python 3.12.14（pytest 9.2.0 / openpyxl 3.1.5）：
   `C:\Users\15455\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe -m pytest tests -q`
-  整套约 3 分钟。`AGENT.md` 里写的 conda 环境在本机不存在。
+  整套约 75 秒（并发跑基准时会到 95 秒）。`AGENT.md` 里写的 conda 环境在本机不存在。
   numpy 2.3.5 可用，但**不要**把 numpy 加进 `pyproject.toml`（用户明确要求）。
 
 ---
@@ -258,7 +264,7 @@ CONTROL_MORALE_RELIEF_PER_OPERATOR = 0.05  # controlData.basicCostBuff = -5（1/
 按组数 `g` 生成 `g` 个相位，相位 `k` 的组 `j` 在 `(plan_index + j) % g == k` 时休息。
 改完再跑 §4 的可行性扫描确认 252/342。
 
-### 第 4 步：把宿舍做成图节点（**下一步要做的，尚未开始**）
+### 第 4 步：把宿舍做成一等分配目标（M1）——**已完成**
 
 **背景变了，先说清楚为什么还值得做。** 原计划的动机是「宿舍是事后贪心 → 只能靠事后否决兜底」。
 第 1、2 步之后 16/16 组合都有 +4.0 以上的收支余量，**可行性已经不是瓶颈**，所以这一步的收益从
@@ -270,73 +276,124 @@ CONTROL_MORALE_RELIEF_PER_OPERATOR = 0.05  # controlData.basicCostBuff = -5（1/
 3. **不搓玉场景的差距**（§5 实测：图卷积在不搓玉上稳定小负）需要更宽的搜索空间才能补，
    而心情目前是「事后否决」，把这种空间直接砍掉了。
 
-**设计（建议按 M1 先交付，M2 再评估）**
+#### 实测结论（先看这个再看实现）
 
-M1：宿舍成为解码的一等目标（不动读出层、不动产能分、不改 `score`）
+- **产能分一格没动**：16 组扫描的 `score` 与 M1 前**逐位相同**（max |Δscore| = 0.0），
+  4 场景基准的混合分/图卷积分也与 §5 表逐位相同。这是设计约束，不是巧合（宿舍不进产能分）。
+- **心情账本不退化**：16 组的最差收支 delta 全部 = 0.0（最差仍是 252/342 3×8 的 +4.0），
+  总恢复 delta 全部 ≥ 0，其中 7 组变好（+1.1 ~ +12.1 心情/周期）。
+- **收益是「宿舍分配有据可依 + 不漏人」**：243 平衡搓玉 2×12 上有床位覆盖从 61 人升到 63 人
+  （全部 63 名上场干员都能轮到床位），总恢复 +3.0。2×12 的紧凑组合（20 床刚好被必休者占满）
+  本来就没什么自由度，账本择优会**保留旧贪心**——这正是"不消耗余量"的保证。
+- **代价**：单场景墙钟 +0.4% ~ +1.5%（243 平衡搓玉 12.82s → 12.87s；333 平衡搓玉 3×8
+  20.01s → 20.31s）。**关键是不能把 beam 放回解码热路径**——那样实测 17.7s → 107.6s（6×），
+  而最终排班一模一样。
+
+#### 原计划（保留作背景）
+
+M1 的目标：宿舍成为解码的一等目标（不动读出层、不动产能分、不改 `score`）
 
 1. 宿舍规格：`RoomSpec(f"dormitory_{i}", "DORMITORY", None, capacity=5, room_level=layout.dormitory_levels[i-1])`。
-   现成入口 `_dorm_specs()`（optimizer.py:2892）返回的四元组改成 `RoomSpec`，调用点同步。
-2. 宿舍价值函数（**手写，不学**，因为宿舍没有产能标签）：对「干员 X 住宿舍 D」
-   `value = dwell_hours × rate(X, D)`，其中 `rate` 直接用 `morale.dormitory_passive_recovery_rate(D.level)`
-   + `morale.dormitory_recovery_bonuses(D)` 的三个通道（all/self/single，single 的目标按 M1 近似为
-   「本宿舍里心情最低的舍友」）。二元项 = 「X 提供的 all/single 加成 × 同宿舍其他人的 dwell_hours」。
-   复用 `RoomValueModel.unary/pair/extra` 的形状（graph_conv.py:570-680）即可，`score_vectors` 已经是通用的。
-3. 解码：`_assign_work_rooms_jointly`（optimizer.py:697）现在是「先联合分配产能房 → 再逐房 `_assign_room`
-   处理其他房（含 CONTROL 等）」。改成三段：
-   a) 联合分配产能房（不动）；
-   b) 联合分配 CONTROL（现在也是逐个分，先不动）；
-   c) **新增**：把「剩下的、且本班次不在岗的人」按宿舍容量做一次 beam 分配（价值 = 上面的
-      `value`，约束 = 每床位 capacity），产出 `shift.dormitories`；同时**保留**
-      `_ensure_sustainable_morale_cycle` 作为最终硬门槛（它仍然是唯一的判定者）。
-   注意现在 `_assign_dormitories`（:2741）还会给「离岗的人 + 锚点」配位，M1 要把它替换掉而不是叠加。
-4. 心情账本进搜索（软目标）：把 M1 的 `value` 只用于宿舍选择本身，**不要**进 `room_output_score`
-   （:3531）——一旦进产能分，`OptimizerResult.score` 与 `scoreBreakdown` 全部失真，
-   基准数字和历史记录不可比。如果要做「心情定价影响工作房选择」（即真正的 M2），
-   应作为 beam 内部的 tie-breaker 或独立的诊断分项，并新增字段而不是改分数。
+2. 宿舍价值函数（**手写，不学**，因为宿舍没有产能标签）。
+3. 解码：在 `_assign_work_rooms_jointly` 里加第三段宿舍 beam。
+4. 心情账本只用于宿舍选择，**不要**进 `room_output_score`。
 
 M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标定 → 会改变短名单，需要重跑基准确认
 `243 balanced` 不退步。**注意**：改 `FEATURE_NAMES` 会让 `graph_signature` 变化、读出层缓存失效、
-下次跑基准要重新拟合（几分钟）。M1 不碰特征，所以缓存不受影响。
+下次跑基准要重新拟合（几分钟）。M1 不碰特征，所以缓存不受影响（实测基准直接复用缓存，没有重拟合）。
 
-**落点清单（都在 `optimizer.py`，行号为当前版本）**
+#### 实际做法（`optimizer.py`）
 
-| 位置 | 现在做什么 | M1 要改成 |
-| --- | --- | --- |
-| `RoomSpec`（:76） | 只有 id/type/target/capacity/level/slots | 不动（宿舍直接用同一结构） |
-| `_assign_work_rooms_jointly`（:697） | 产能联合 → 其余逐房 | 产能联合 → 其余逐房 → **宿舍 beam** |
-| `_joint_production_room_assignments`（:732） | 产能房 beam | 不动（可参考它的 beam 写法） |
-| `_dorm_specs`（:2892） | 返回四元组 | 返回 `RoomSpec` 列表 |
-| `_assign_dormitories`（:2741） | 事后贪心 + 锚点 | 被 M1 的宿舍 beam 取代（保留函数供 `_rebuild_dormitories` 用或一并删） |
-| `_improve_dormitory_anchor_coverage`（:2605） | 锚点覆盖修补 | M1 之后应变成 no-op 或随锚点测试一起改写 |
-| `room_output_score`（:3531） | 产能分 | **不动**（宿舍不得进产能分） |
-| `morale.py` | 审计/判定 | 只读使用（`dormitory_passive_recovery_rate` / `dormitory_recovery_bonuses`） |
+1. **宿舍规格**：`_dorm_specs()` 返回 `RoomSpec`（容量 5，`slots=5`），等级取
+   `levels_or_default(layout.dormitory_levels, layout.dormitory, 5)` —— 必须和心情审计的
+   `layout.dormitory_levels[i] if i < len(...) else 5` 同口径，否则 beam 按 4.0/h 定价、
+   审计按 2.0/h 记账。
+2. **共用速率函数（关键）**：`morale.py` 新增
+   - `dormitory_operator_bonuses(skill)`（单个技能的 all/self/single 解析，`dormitory_recovery_bonuses` 改为基于它）；
+   - `dormitory_recovery_rates(room, passive)`（**审计与 beam 共用的唯一速率入口**）；
+   - `dormitory_single_target(room)`、`control_dormitory_boost(shift)`、`morale_consumption_by_operator(layout, shifts)`。
+   `_recover_dormitory_room` 改成调用它们，所以不存在"两套 rate 函数漂移"的风险。
+3. **价值函数**：`_dormitory_stay_value(operators, room_level, dwell_hours, dormitory_boost, need)`
+   返回 `(accounted, deficit_credit)`：
+   - `accounted` = 一次停留的账面恢复（Σ rate × hours，单体技能按"本宿舍最缺心情的舍友"近似、
+     总量与实际一致）；
+   - `deficit_credit` = `Σ min(rate × hours, need[X])`，**只把缺口补上就够**。用它当主目标可以
+     避免"谁消耗高就给谁多塞床位"，让床位流向还没补上的人。
+4. **beam**：`_beam_dormitory_rooms` 按房间顺序做 beam（宽度 8，候选池 40）：
+   必休者先按边际价值落位（硬约束），空床位有两种填法（先补缺口 / 先最大化账面恢复），
+   先处理等级高的宿舍（床位不够时先填满它），输出顺序仍按 `_dorm_specs` 下标。
+5. **落点**：`_assign_dormitory_quarters(layout, shifts, required_rest=...)` 在
+   **`_ensure_sustainable_morale_cycle`** 里对整条排班调用一次（不是在解码的每个班次里），
+   见下面「为什么不在 `_assign_work_rooms_jointly`」。
+6. **三候选 + 账本裁决**：一次调用产出 `deficit` beam、`recovery` beam、旧贪心三份宿舍分配，
+   用 `_dormitory_plan_key` = 审计自己的 `(hardGatePassed, 最差收支, 总恢复)` 择优，
+   并列时保留 beam。所以 **M1 的分配永远不会比旧贪心差**（旧贪心是候选之一），
+   "提高余量但不消耗最差收支"不是靠手调权重，而是由门槛自己的账本裁决。
+7. **锚点覆盖保留**：`_improve_dormitory_anchor_coverage` 的语义是"让用户指定的锚点出现在导出里"，
+   与心情无关，仍在 `_build_shifts` / 门槛之后跑，且从不替换必休的人。
+8. **锚点偏好也进了 beam 的并列裁决**（`_dormitory_anchor_key`），所以 beam 不会把锚点挤没。
 
-**验收标准（缺一不可）**
+#### 为什么不在 `_assign_work_rooms_jointly`（与计划的偏差，重要）
 
-1. `pytest tests -q` 全绿（现状 254 passed / 1 skipped / 1 expected-fail）。
-2. 16 组可行性扫描仍全过（脚本见 §4），且**最差收支不低于 +4.0**（M1 的目的是提高余量，不是消耗余量）。
-3. 基准不退化：`--cases 243-balanced-2x12,243-normal-2x12,333-balanced-3x8-auto,333-max-2x12-auto`
-   的混合分与图卷积分与 §5 表的差值在 ±0.5% 内；`outputs/benchmark/graph_vs_hybrid_benchmark.md`
-   的短名单表仍然是 5/5 命中、top16 召回 1.0。
-4. 新增测试（建议放 `tests/test_optimizer.py`）：
-   - 宿舍 beam 满足「每班次上床位数 ≤ capacity、同一人不能同时在岗和休息」；
-   - 给定固定产能分配时，宿舍 beam 的账面恢复 ≥ 现有贪心（用 `morale` 的 ledger 对比）；
-   - `result.score` 与改动前**完全一致**（宿舍不进产能分的回归锁）；
-   - `_ensure_sustainable_morale_cycle` 在 M1 输出上仍然通过（不需要它再"救场"）。
-5. `generate` 端到端 243/333/342 各跑一次 exit 0，`cycleHours ≤ 168`。
+计划写在 `_assign_work_rooms_jointly` 的第三段，实际落在心情硬门槛里，原因两条：
 
-**风险 / 陷阱**
+1. **床位是跨班次共享的稀缺资源**：`_assign_work_rooms_jointly` 每个班次调一次，
+   看不到"这个干员在整个周期里缺多少心情"，也就没法把 20 张床在 4 个班次之间分摊。
+2. **性能**：`_rebuild_dormitories`（插入/替换搜索的热路径）一次 `optimize()` 会调几百次。
+   在那儿做 beam 实测把 243 平衡搓玉从 17.7s 拖到 107.6s（6×），而**最终排班一模一样**
+   —— 因为宿舍不进产能分，搜索层根本看不到它。所以：
+   - `_build_shifts` / `_rebuild_dormitories` 保持**便宜的逐班次贪心**；
+   - 真正的 beam 只跑在最终排班上（门槛里，一次）。
 
-- 宿舍价值与心情审计必须用**同一套** rate 函数，否则 beam 认为「很划算」而审计认为「不够」，
-  §8 的 `cycle_exceeds_seven_days`/`morale_balance_deficit` 会在 `generate` 里炸。
-- `_ensure_sustainable_morale_cycle` 仍会**改写**计划（错峰展开）：M1 之后它应该基本不触发；
-  如果它还在频繁触发，说明宿舍 beam 的目标没对齐审计口径。
-- 图优化器是子类，父类解码改动会继承；改完跑 `tests/test_graph_optimizer.py`，
-  注意 `_closure_override` / 候选缓存的失效（§8 第 3 条）。
-- 别把宿舍放进 `_room_specs_for_targets`（:2857）的目标枚举里 —— 那会污染目标选择分。
+一个直接后果：**错峰展开仍然会触发**（29 个在岗 > 20 床是结构性的，与宿舍分配无关）。
+原计划里"M1 之后门槛基本不触发"的预期不成立；那是第 3 步（轮转表）的事，不是宿舍分配的事。
 
-**工作量**：约一个完整窗口。`optimizer.py` 改 4 处 + 新增 1-2 个函数（约 150-250 行），
-新增 4-5 个测试，然后 1 次全量测试 + 1 次 4 场景基准 + 1 次 16 组扫描。
+#### 落点清单（实际改动）
+
+| 位置 | 改动 |
+| --- | --- |
+| `_dorm_specs` | 返回 `RoomSpec`（含 level / slots），`levels_or_default(..., 5)` |
+| `_assign_dormitories` / `_assign_required_rest_dormitories` | 保留为**贪心基线**（M1 的候选之一），签名改吃 `RoomSpec`，产出带 `room_level` / `slots` |
+| `_assign_dormitory_quarters`（新增） | 整条排班一次分配：两套 beam + 贪心候选，审计账本择优 |
+| `_beam_dormitory_rooms` / `_dormitory_*`（新增） | beam、价值函数、候选池、目标函数 |
+| `_build_shifts` / `_rebuild_dormitories` | **保持贪心**（热路径），只补注释说明为什么 |
+| `_ensure_sustainable_morale_cycle` | 门槛通过时用 beam 升级再复核；需要展开时对展开后的排班做 beam（`required_rest` = 离岗者） |
+| `morale.py` | 新增共用速率/记账函数，`_recover_dormitory_room` 改为调用 |
+| `room_output_score` | **不动**（宿舍不进产能分，测试锁死） |
+
+#### 验收标准（全部通过）
+
+1. `pytest tests -q`：**262 passed / 1 skipped / 1 expected-fail**（新增 8 个宿舍测试）。
+2. 16 组可行性扫描全过，最差收支 **+4.0**（与 M1 前逐格相同，没有更差；7 格总恢复变好）。
+3. 基准不退化：4 场景的混合分/图卷积分与 §5 表**逐位相同**（±0.0%），短名单 5/5 命中、
+   top16 召回 1.0；252/342 的对照表也逐位相同。
+4. 新增测试（`tests/test_optimizer.py::DormitoryFirstClassAssignmentTest`，8 个）：
+   - 规格带等级（`_dorm_specs`）；
+   - 每班次上床位数 ≤ capacity、同一人不能同时在岗和休息、跨宿舍不重复、离岗的人不漏；
+   - 宿舍 beam 的账面恢复/账本恢复 ≥ 旧贪心（构造"工种分低但带全员加成"的干员，
+     旧贪心会把他挤掉，beam 不会）；
+   - 全员加成只按最大值计一次、自律节点只吃自己 +2/h；
+   - `_dormitory_stay_value` 与 `audit_morale_cycle` 的 ledger **对得上**（同一套 rate 函数的锁）；
+   - `result.score` 不受宿舍分配影响（把 `dormitories` 清空后重算分数不变 + 产能房完全不变）；
+   - `_ensure_sustainable_morale_cycle` 在 beam 输出上仍然通过。
+5. `generate` 端到端 243/333/342 各跑一次 exit 0（见 §4 末尾）。
+
+#### 风险 / 陷阱（踩过的都在这）
+
+- **宿舍价值与心情审计必须用同一套 rate 函数**。这条在实现上是
+  `morale.dormitory_recovery_rates` 唯一入口；测试 `test_dormitory_stay_value_matches_the_morale_audit_ledger`
+  就是防漂移的锁。别在优化器里再抄一份正则。
+- **别把 beam 放回解码热路径**（`_build_shifts` / `_rebuild_dormitories`）。会 6× 墙钟，收益为零。
+- **单目标（总和）会牺牲最差收支**：先用 `recovery`（总恢复）当目标时，
+  252/342 的 2×12 组合最差收支从 7.2 掉到 6.0（总恢复反而略高）。所以最终是
+  "三候选 + 审计账本按 `(门槛, 最差收支, 总恢复)` 字典序择优"，不是单目标最大化。
+- **封顶效用（deficit）单独用也不够**：它会让 beam 不再奖励"全员加成"（因为室友已经补满），
+  3×8 组合的总恢复反而降了 4~19。两个目标都要留着当候选。
+- 图优化器是子类，父类解码改动会继承；`tests/test_graph_optimizer.py` 全绿，`_closure_override`
+  与候选缓存不受影响（M1 没碰短名单/特征，读出层缓存继续复用）。
+- 别把宿舍放进 `_room_specs_for_targets` 的目标枚举里 —— 会污染目标选择分。
+- `_ensure_sustainable_morale_cycle` 仍然会**改写**计划（错峰展开），M1 之后也一样：
+  结构性原因（在岗人数 > 床位数），与宿舍分配质量无关。
 
 ### 第 5 步（之后）：办公室选人
 
@@ -348,17 +405,24 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 
 ---
 
-## 4. 复现用的诊断脚本（本轮用过，已删，可按需重建）
+## 4. 复现用的诊断脚本
 
-```python
-# 可行性扫描：哪些布局/模式/班次能过心情门槛
-for raw in ("243", "252", "342", "333"):
-    for mode in ("normal", "balanced-orundum", "max-orundum"):
-        for cnt, hrs in ((2, 12), (3, 8)):
-            for drone in ("none", "auto"):
-                try: ScheduleOptimizer(...).optimize(...); print("OK")
-                except ValueError as exc: print("FAIL", str(exc)[:70])
+`tools/scan_m1_dormitory.py`（本轮新增，**没有删**）：跑 布局 × 模式 × 班次 的组合，
+打印分数、`cycleHours`、最差收支、宿舍等级、总恢复与耗时，并把明细写成 JSON。
+默认就是下面这 16 组；`--layouts/--modes/--shift-patterns` 可以只跑子集。
+
+```powershell
+python tools/scan_m1_dormitory.py --output outputs/scan_m1_dormitory.json
+# 只跑紧凑的 2×12： --layouts 252,342 --shift-patterns 2x12
 ```
+
+同目录还有：`tools/time_one_case.py`（单场景墙钟）、`tools/inspect_one_case.py`（审计摘要 +
+宿舍分配）、`tools/inspect_worst_balance.py`（最差收支的干员与其休息/在岗班次）、
+`tools/check_generate_outputs.py`（检查 `generate` 导出的 `cycleHours` / 门槛）。
+
+---
+
+### §4a 历史：修判定/补绿字的过程
 
 本轮结果（rebase 后、修判定前）：**只有 243 与 333 通过**；252/342 全部失败。
 
@@ -381,6 +445,34 @@ for raw in ("243", "252", "342", "333"):
 结论：**「5 制造站结构性不可行」作废**。默认基准仍保留 243/333 只为让历史数字可比；
 `graph_benchmark.py` 的注释已同步。
 
+### §4b M1 之后的 16 组扫描（同一脚本，逐格对比 M1 前）
+
+| 组合 | 分数（前→后） | 最差收支（前→后） | 总恢复（前→后） |
+| --- | --- | --- | --- |
+| 243 普通 2×12 | 605.6 → 605.6 | 30.0 → 30.0 | 3891.4 → 3891.4 |
+| 243 普通 3×8 | 563.5 → 563.5 | 14.0 → 14.0 | 5915.6 → **5920.4** |
+| 243 平衡 2×12 | 380.3 → 380.3 | 30.0 → 30.0 | 3989.5 → 3989.5 |
+| 243 平衡 3×8 | 354.9 → 354.9 | 20.0 → 20.0 | 3902.2 → **3908.1** |
+| 252 普通 2×12 | 646.6 → 646.6 | 7.2 → 7.2 | 2243.9 → 2243.9 |
+| 252 普通 3×8 | 599.7 → 599.7 | 4.0 → 4.0 | 2110.7 → **2122.8** |
+| 252 平衡 2×12 | 359.9 → 359.9 | 7.2 → 7.2 | 2240.0 → 2240.0 |
+| 252 平衡 3×8 | 333.1 → 333.1 | 4.0 → 4.0 | 2147.4 → 2147.4 |
+| 342 普通 2×12 | 680.8 → 680.8 | 7.2 → 7.2 | 2244.6 → 2244.6 |
+| 342 普通 3×8 | 632.4 → 632.4 | 4.0 → 4.0 | 2134.1 → **2135.2** |
+| 342 平衡 2×12 | 546.6 → 546.6 | 7.2 → 7.2 | 2250.7 → 2250.7 |
+| 342 平衡 3×8 | 499.0 → 499.0 | 4.0 → 4.0 | 2150.4 → **2158.2** |
+| 333 普通 2×12 | 696.3 → 696.3 | 30.0 → 30.0 | 3889.7 → 3889.7 |
+| 333 普通 3×8 | 641.5 → 641.5 | 20.0 → 20.0 | 3898.1 → 3898.1 |
+| 333 平衡 2×12 | 544.3 → 544.3 | 30.0 → 30.0 | 3996.6 → **4008.6** |
+| 333 平衡 3×8 | 498.0 → 498.0 | 20.0 → 20.0 | 3893.0 → **3899.0** |
+
+- **16/16 通过，最差收支 +4.0**（与 M1 前逐格相同：`min Δbalance = 0.0`）。
+- **分数逐位相同**（`max |Δscore| = 0.0`）——宿舍不进产能分这条锁住了。
+- 总恢复 `min Δ = 0.0`，7 格变好（+1.1 ~ +12.1 心情/周期），一个都没变差。
+- 单场景墙钟 +0.4% ~ +1.5%（隔离测：243 平衡 2×12 12.82s → 12.87s；333 平衡 3×8 20.01s → 20.31s）。
+- `generate` 端到端（图优化器、平衡搓玉）：243 `cycleHours=144`、333/342 `cycleHours=48`，
+  全部 exit 0 且 `hardGatePassed=True`，最差收支 93.6 / 31.2 / 7.2。
+
 ---
 
 ## 5. 基准现状（rebase 后，1 胜 3 负，均比 0.981）
@@ -392,12 +484,20 @@ for raw in ("243", "252", "342", "333"):
 | 333 平衡搓玉 3×8 auto | 498.041 | 483.634 | −2.89% | 0.700× |
 | 333 极限搓玉 2×12 auto | 504.514 | 482.235 | −4.42% | 0.760× |
 
+**M1 之后重跑：四个场景的混合分与图卷积分逐位相同**（`outputs/benchmark_m1/`），
+短名单仍然 5/5 命中、top16 召回 1.0，读出层缓存直接复用（没有重拟合）。
+墙钟 13.00 / 9.24 / 25.88 / 20.48 秒（图卷积更快，平均墙钟比 0.884）。
+
 333 落后的诊断（已排除）：加宽短名单更差（128 → −30.8，192/beam22 → −35.8）、
 加第三个起手无变化。**推断**：短名单只优化房间产能分，而心情门槛给「宿舍恢复能力」定价，
-混合算法穷举会碰巧选中休息友好的人。**这正好由 §3 第 4 步（宿舍图节点）解决。**
+混合算法穷举会碰巧选中休息友好的人。**§3 第 4 步（M1）做完后的结论：这条推断只对了一半** ——
+宿舍分配确实变成一等目标了，但 16 组扫描里最差收支一格都没变、分数也没变，因为
+**心情门槛在满练表上本来就有 +4.0 以上的余量**，宿舍再怎么分都不会改变"谁上场"。
+要缩小 333 的差距，得动**搜索空间**（短名单/起手/插入预算）或**班次结构**（§3 第 3 步），
+不是宿舍分配。
 
-修完第 1、2 步之后 243/333 的分数没有变（605.566 / 380.290 / 498.041 全部复现），
-因为这两步只改心情判定与心情模型。
+修完第 1、2、4 步之后 243/333 的分数没有变（605.566 / 380.290 / 498.041 全部复现），
+因为这三步只改心情判定、心情模型与宿舍分配。
 
 **252/342 的新对照已经跑完**（心情模型放宽后第一次，2×12、无人机 none）：
 
@@ -414,10 +514,13 @@ python -m arknights_schedule_generator benchmark --roster .\examples\fixtures\yi
 | 342 平衡搓玉 | 546.560 | **563.977** | +3.19% | 0.846× |
 | 342 不搓玉 | 680.768 | 659.705 | −3.09% | 0.865× |
 
-2 胜 2 负，平均分数比 1.000938，平均墙钟比 0.772，平均模拟器调用比 0.730；短名单 5/5 命中、
-top16 召回 1.0。**规律：搓玉目标稳赢、不搓玉目标稳输**（243/252/342 三组都是这个符号），
+2 胜 2 负，平均分数比 1.000938，平均墙钟比 0.7777，平均模拟器调用比 0.731；短名单 5/5 命中、
+top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_252_342_m1/`），
+墙钟 19.67 / 9.84 / 20.30 / 9.48 秒。
+**规律：搓玉目标稳赢、不搓玉目标稳输**（243/252/342 三组都是这个符号），
 机制见 `docs/graph_optimizer.md` §5 与 §6 第 2 条（合成玉贸易站零梯度 → 短名单在该房间随机，
-混合算法穷举碰巧更好）。下次要缩小不搓玉的差距，优先做 §3 第 4 步（宿舍/房间联合解码）。
+混合算法穷举碰巧更好）。下一步要缩小不搓玉的差距，得动搜索空间或班次结构：
+§3 第 4 步（宿舍一等分配）做完后已确认**不是**这个差距的原因（见 §5 的结论）。
 
 ---
 
@@ -437,7 +540,7 @@ top16 召回 1.0。**规律：搓玉目标稳赢、不搓玉目标稳输**（243
 
 ---
 
-## 7. 工作区状态（前三步都已提交）
+## 7. 工作区状态（前四步都已提交）
 
 第 1 步（`d78daad`）已提交：`morale.py` 收支记账判定 + `tests/test_morale.py` + `optimizer.py` 文案
 + `graph_benchmark.py` 容错 + `docs/*`。
@@ -452,12 +555,35 @@ top16 召回 1.0。**规律：搓玉目标稳赢、不搓玉目标稳输**（243
 | `tests/test_morale.py` | 22 个（新增 3 个：最低心情舍友、不给自己、回满后移交） |
 | `docs/*` | handoff §2.1/§2.2/§3/§4/§5、`graph_optimizer.md` §5b、`memory/next_steps.md` P12、`AGENT.md` 心情口径 |
 
+第 4 步 M1（宿舍一等分配）的改动（提交信息：`Make dormitory assignment a first-class decode target (M1)`，
+即 `git log` 里最新那个提交）：
+
+| 文件 | 改动 |
+| --- | --- |
+| `morale.py` | 新增共用速率/记账函数 `dormitory_operator_bonuses` / `dormitory_recovery_rates` / `dormitory_single_target` / `control_dormitory_boost` / `morale_consumption_by_operator`；`dormitory_recovery_bonuses` 与 `_recover_dormitory_room` 改为调用它们（一套正则） |
+| `optimizer.py` | `_dorm_specs` → `RoomSpec`（带 level/slots）；新增 `DormitoryRecoveryProfile` / `dormitory_plan_signature` 与 M1 方法组（`_assign_dormitory_quarters` / `_beam_dormitory_plan` / `_greedy_dormitory_plan` / `_select_dormitory_plan` / `_dormitory_plan_key` / `_beam_dormitory_rooms` / `_dormitory_fill_options` / `_greedy_dormitory_fill` / `_dormitory_insertion_key` / `_dormitory_stay_value` / `_dormitory_objective_value` / `_dormitory_candidate_objective` / `_dormitory_assignment` / `_dormitory_candidate_pool` / `_dormitory_anchor_key` / `_dormitory_profile`）；`_ensure_sustainable_morale_cycle` 落点；`_build_shifts` / `_rebuild_dormitories` 保持贪心 |
+| `tests/test_optimizer.py` | 新增 `DormitoryFirstClassAssignmentTest`（8 个）+ 4 个宿舍 fixture helper |
+| `tools/` | 新增 `scan_m1_dormitory.py` / `time_one_case.py` / `inspect_one_case.py` / `inspect_worst_balance.py` / `check_generate_outputs.py` |
+| `docs/*` | 本文件 §0/§3/§4/§5/§7/§8、`graph_optimizer.md` §5b、`AGENT.md` 心情口径 |
+
 ---
 
 ## 8. 陷阱清单
 
-- **下一步是 §3 第 4 步**（宿舍变一等分配目标）。动手前先读那一节的「背景变了」——
-  可行性已经不是瓶颈，别按旧动机去改。
+- **下一步是 §3 第 5 步（办公室选人）或第 3 步（错峰轮转表）**。第 4 步（M1）已完成，
+  别再当它是待办；也别再拿"M1 能补上不搓玉差距"当前提（§5 已证伪）。
+- **宿舍分配不要放回解码热路径**（`_build_shifts` / `_rebuild_dormitories`）：那里一次
+  `optimize()` 会调几百次，做 beam 实测 6× 墙钟、最终排班一模一样。beam 只在
+  `_ensure_sustainable_morale_cycle` 里对最终排班跑一次。
+- **宿舍速率函数只有一个入口**：`morale.dormitory_recovery_rates`。优化器侧不许再抄正则
+  （`_dormitory_profile` 只是缓存 `dormitory_operator_bonuses` 的结果）。
+  测试 `test_dormitory_stay_value_matches_the_morale_audit_ledger` 是防漂移的锁。
+- **`_dorm_specs` 的等级必须走 `levels_or_default(layout.dormitory_levels, layout.dormitory, 5)`**，
+  与审计的 `layout.dormitory_levels[i] if i < len(...) else 5` 同口径；否则 252/342
+  （`(1,1,1,2)`）会按 4.0/h 定价、按 2.0/h 记账。
+- **宿舍分配不能只最大化总恢复**：单目标会让 252/342 的 2×12 最差收支从 7.2 掉到 6.0
+  （总恢复反而略高）。现在用三候选 + 审计账本 `(门槛, 最差收支, 总恢复)` 字典序择优；
+  改目标函数时一定要重跑 §4 的扫描看 `worstBalance` 有没有掉。
 - `optimize()` 现在会因心情门槛抛 `ValueError`；`recommend` 会把它记为 skipped candidate，
   CLI `generate` 会直接崩 —— 写新代码时记得 try/except。
 - `_apply_pure_gold_drone_cycle_repeats` 里必须同时尊重 `MAX_CYCLE_HOURS`（168h），
@@ -465,7 +591,8 @@ top16 召回 1.0。**规律：搓玉目标稳赢、不搓玉目标稳输**（243
 - 图优化器是 `ScheduleOptimizer` 子类，**新增的父类逻辑会自动继承**（心情门槛就是这样进来的）。
   改父类方法时要考虑子类的 `_closure_override` / 缓存失效。
 - `docs/graph_optimizer.md` §5b 与 `AGENT.md` 的「关键口径」曾经写成「宿舍不进模型」，
-  那是 rebase 前的旧基线；已更正为「宿舍参与心情硬门槛」。不要再照旧说法写文档。
+  那是 rebase 前的旧基线；已更正为「宿舍参与心情硬门槛」，第 4 步之后又更正为
+  「宿舍是一等分配目标（M1）」。不要再照旧说法写文档。
 - **不要再把「周期末心情 vs 周期初心情」写成判据**（`cycle_does_not_restore_initial_morale`
   已删除）。24 封顶会丢弃恢复，这个比较会把可行排班判成不可行。判定只认
   `moraleBalanceDeficitOperators`（每人一周期收支）；`steadyState.converged` 是诊断，不是门槛。
