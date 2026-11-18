@@ -1148,3 +1148,30 @@ Two facts confirmed for the record (also written into `docs/graph_optimizer.md` 
   Known limits: the fit does not price the morale cost of lowering dormitory levels, and the
   `guide`/`basic` presets skip the adjustment entirely (252/342 + guide keeps `feasible=False`).
 
+
+## P14 - First 252/342 Graph-vs-Hybrid Benchmark (now that 5 factories are feasible)
+
+Command (drone none, 2x12, both modes), report in `outputs/benchmark_252_342/`:
+
+| case | hybrid | graph | delta | eval ratio |
+| --- | --- | --- | --- | --- |
+| 252 balanced | 359.870 | 361.821 | +0.54% | 0.625x |
+| 252 normal | 646.577 | 644.897 | -0.26% | 0.583x |
+| 342 balanced | 546.560 | 563.977 | +3.19% | 0.846x |
+| 342 normal | 680.768 | 659.705 | -3.09% | 0.865x |
+
+2 wins / 2 losses, mean score ratio 1.000938, mean wall 0.772x, mean evaluate calls 0.730x. Shortlist
+5/5 exact-best, top16 recall 1.0, so the differences come from downstream beam tie ordering, not from
+missing combinations.
+
+Pattern across both benchmark sets: the graph optimizer wins every `balanced-orundum` case
+(243 +0.24%, 252 +0.54%, 342 +3.19%) and loses every `normal` case (243 -0.39%, 252 -0.26%,
+342 -3.09%). This is consistent with the zero-gradient Orundum trade room (`docs/graph_optimizer.md` 6.2):
+in `normal` mode that room dominates the difference and the shortlist is effectively random there, while
+the hybrid's exhaustive enumeration happens to land on better ties. Closing it needs the joint
+room/dormitory decode (handoff step 4), not a wider shortlist (already measured: widening makes it worse).
+
+Note for future benchmark runs: the report's `graphConflicts` / `hybridConflicts` count
+`boundary:<shift>:...` records, i.e. operators working two consecutive shifts (the normal rotation
+shape), 4 per case for both algorithms. They are not same-shift conflicts.
+

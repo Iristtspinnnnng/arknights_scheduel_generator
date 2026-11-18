@@ -409,6 +409,10 @@ def graph_audit(args: argparse.Namespace) -> int:
     for pair in report["namedDependencyPairs"]:
         print(f"- {pair}")
     print(f"孤立干员: {report['isolatedOperatorCount']}")
+    print(
+        f"特殊心情节点（恢复自给自足，如 自律）: {report['specialMoraleNodeCount']}"
+        + (f" -> {', '.join(report['specialMoraleNodes'])}" if report["specialMoraleNodes"] else "")
+    )
     return 0
 
 
