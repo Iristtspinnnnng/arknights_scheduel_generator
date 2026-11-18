@@ -1,8 +1,8 @@
 # 接手文档：图卷积优化器 + 心情/宿舍模型
 
 > 写于上下文耗尽前。下一个窗口从这里开始，不必回读聊天记录。
-> 最后更新：第 1 步（修 `morale.audit_morale_cycle` 判定）+ 第 2 步（宿舍绿字、减耗、控制中枢）
-> 都已完成；252/342 已由「全部失败」变成全部可行。回归测试在 `tests/test_morale.py`。
+> 最后更新：第 1、2 步 + 单体宿舍恢复 + 菲亚梅塔（自给自足节点）+ 252/342 基准都已完成；
+> **下一个窗口从 §3 第 4 步（宿舍做成一等分配目标）开始**，计划、落点、验收标准都写在那一节。
 
 ---
 
@@ -258,34 +258,85 @@ CONTROL_MORALE_RELIEF_PER_OPERATOR = 0.05  # controlData.basicCostBuff = -5（1/
 按组数 `g` 生成 `g` 个相位，相位 `k` 的组 `j` 在 `(plan_index + j) % g == k` 时休息。
 改完再跑 §4 的可行性扫描确认 252/342。
 
-### 第 4 步：把宿舍做成图节点（用户提议，赞同）
+### 第 4 步：把宿舍做成图节点（**下一步要做的，尚未开始**）
 
-**为什么对**：当前架构里宿舍是**事后贪心**（`_assign_dormitories`），所以门槛只能靠「事后否决 +
-错峰发明」来兜；一旦把宿舍变成一等分配目标，心情就变成**可定价的软账**，不需要那条
-「离岗必须立刻休息」的硬规则。
+**背景变了，先说清楚为什么还值得做。** 原计划的动机是「宿舍是事后贪心 → 只能靠事后否决兜底」。
+第 1、2 步之后 16/16 组合都有 +4.0 以上的收支余量，**可行性已经不是瓶颈**，所以这一步的收益从
+「让 5 制造站可行」变成下面三件事：
+1. **质量**：现在 `_assign_dormitories` 只看「谁离岗了」+ 少量锚点偏好，不看「谁在宿舍里恢复得值」。
+   同一批人换个宿舍、换个人轮休，产能相同但心情余量差很多 —— 余量是以后放松班次表的本钱。
+2. **让部分人连班、部分人轮休**：宿舍容量 = `layout.dormitory × 5`（243 = 20 床），在岗 29 人，
+   现在的错峰展开只能整组整组地轮休；一等分配后可以用「容量匹配」自然做到混合轮换。
+3. **不搓玉场景的差距**（§5 实测：图卷积在不搓玉上稳定小负）需要更宽的搜索空间才能补，
+   而心情目前是「事后否决」，把这种空间直接砍掉了。
 
-具体做法：
+**设计（建议按 M1 先交付，M2 再评估）**
 
-1. **节点**：为每个宿舍床位建节点（`dorm:1..N`），与干员节点连边。
-   特征：宿舍等级、氛围、当前恢复率（白字+绿字）、是否已被占用。
-2. **边**：`dorm_rec` 边（干员→宿舍），权重由该干员的宿舍恢复技能解析得到
-   （`dorm_rec_oneself[*]` / 所有干员 / 单体）。这样 `graph_bonds` 的显式基可以直接复用。
-3. **读出层**：一元项加「该干员在宿舍的恢复贡献」，二元项加「同宿舍恢复叠加」。
-   现有 `RoomValueModel` 的 `unary + pair` 结构可以原样吃下，只需给 `RoomSpec` 增加
-   `room_type="DORMITORY"` 的规格，并把 `_room_specs_for_targets` 里补上宿舍。
-4. **解码**：每班次每个干员有且只有一个去向（工作房 / 宿舍 / 闲置）。这就是一个
-   带容量的二分匹配，`_assign_work_rooms_jointly` 的 beam 结构可以直接扩展——
-   把宿舍作为「容量 = 床位、价值 = 心情恢复」的房间加入同一个 beam。
-5. **心情账本**：解码时按 §2.1 的 4.0/h 记账（6h 回满），把它作为
-   **软目标**（进入 `room_output_score` / `score_breakdown` 的一个小权重项）
-   加**硬约束**（每周期收支 ≥ 0）。这样门槛不再是事后否决，而是搜索时就知道。
+M1：宿舍成为解码的一等目标（不动读出层、不动产能分、不改 `score`）
 
-风险提示：
-- 不要让宿舍节点进入产能分项，只进「心情可持续性」分项，否则会把分数算错。
-- 现有 `moraleCycleAudit` 的字段被 exporter / HTML 读，新增字段可以，删改要谨慎。
-- 宿舍容量 = `layout.dormitory × 5`，而 243 在岗 29 人 > 20 床位 —— 这正是「每人每天只上 1 个班」
-  与「离岗必须立刻休息」冲突的根源。做成图节点后，可以允许**部分人连班、部分人轮休**，
-  这个冲突自然消失。
+1. 宿舍规格：`RoomSpec(f"dormitory_{i}", "DORMITORY", None, capacity=5, room_level=layout.dormitory_levels[i-1])`。
+   现成入口 `_dorm_specs()`（optimizer.py:2892）返回的四元组改成 `RoomSpec`，调用点同步。
+2. 宿舍价值函数（**手写，不学**，因为宿舍没有产能标签）：对「干员 X 住宿舍 D」
+   `value = dwell_hours × rate(X, D)`，其中 `rate` 直接用 `morale.dormitory_passive_recovery_rate(D.level)`
+   + `morale.dormitory_recovery_bonuses(D)` 的三个通道（all/self/single，single 的目标按 M1 近似为
+   「本宿舍里心情最低的舍友」）。二元项 = 「X 提供的 all/single 加成 × 同宿舍其他人的 dwell_hours」。
+   复用 `RoomValueModel.unary/pair/extra` 的形状（graph_conv.py:570-680）即可，`score_vectors` 已经是通用的。
+3. 解码：`_assign_work_rooms_jointly`（optimizer.py:697）现在是「先联合分配产能房 → 再逐房 `_assign_room`
+   处理其他房（含 CONTROL 等）」。改成三段：
+   a) 联合分配产能房（不动）；
+   b) 联合分配 CONTROL（现在也是逐个分，先不动）；
+   c) **新增**：把「剩下的、且本班次不在岗的人」按宿舍容量做一次 beam 分配（价值 = 上面的
+      `value`，约束 = 每床位 capacity），产出 `shift.dormitories`；同时**保留**
+      `_ensure_sustainable_morale_cycle` 作为最终硬门槛（它仍然是唯一的判定者）。
+   注意现在 `_assign_dormitories`（:2741）还会给「离岗的人 + 锚点」配位，M1 要把它替换掉而不是叠加。
+4. 心情账本进搜索（软目标）：把 M1 的 `value` 只用于宿舍选择本身，**不要**进 `room_output_score`
+   （:3531）——一旦进产能分，`OptimizerResult.score` 与 `scoreBreakdown` 全部失真，
+   基准数字和历史记录不可比。如果要做「心情定价影响工作房选择」（即真正的 M2），
+   应作为 beam 内部的 tie-breaker 或独立的诊断分项，并新增字段而不是改分数。
+
+M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标定 → 会改变短名单，需要重跑基准确认
+`243 balanced` 不退步。**注意**：改 `FEATURE_NAMES` 会让 `graph_signature` 变化、读出层缓存失效、
+下次跑基准要重新拟合（几分钟）。M1 不碰特征，所以缓存不受影响。
+
+**落点清单（都在 `optimizer.py`，行号为当前版本）**
+
+| 位置 | 现在做什么 | M1 要改成 |
+| --- | --- | --- |
+| `RoomSpec`（:76） | 只有 id/type/target/capacity/level/slots | 不动（宿舍直接用同一结构） |
+| `_assign_work_rooms_jointly`（:697） | 产能联合 → 其余逐房 | 产能联合 → 其余逐房 → **宿舍 beam** |
+| `_joint_production_room_assignments`（:732） | 产能房 beam | 不动（可参考它的 beam 写法） |
+| `_dorm_specs`（:2892） | 返回四元组 | 返回 `RoomSpec` 列表 |
+| `_assign_dormitories`（:2741） | 事后贪心 + 锚点 | 被 M1 的宿舍 beam 取代（保留函数供 `_rebuild_dormitories` 用或一并删） |
+| `_improve_dormitory_anchor_coverage`（:2605） | 锚点覆盖修补 | M1 之后应变成 no-op 或随锚点测试一起改写 |
+| `room_output_score`（:3531） | 产能分 | **不动**（宿舍不得进产能分） |
+| `morale.py` | 审计/判定 | 只读使用（`dormitory_passive_recovery_rate` / `dormitory_recovery_bonuses`） |
+
+**验收标准（缺一不可）**
+
+1. `pytest tests -q` 全绿（现状 254 passed / 1 skipped / 1 expected-fail）。
+2. 16 组可行性扫描仍全过（脚本见 §4），且**最差收支不低于 +4.0**（M1 的目的是提高余量，不是消耗余量）。
+3. 基准不退化：`--cases 243-balanced-2x12,243-normal-2x12,333-balanced-3x8-auto,333-max-2x12-auto`
+   的混合分与图卷积分与 §5 表的差值在 ±0.5% 内；`outputs/benchmark/graph_vs_hybrid_benchmark.md`
+   的短名单表仍然是 5/5 命中、top16 召回 1.0。
+4. 新增测试（建议放 `tests/test_optimizer.py`）：
+   - 宿舍 beam 满足「每班次上床位数 ≤ capacity、同一人不能同时在岗和休息」；
+   - 给定固定产能分配时，宿舍 beam 的账面恢复 ≥ 现有贪心（用 `morale` 的 ledger 对比）；
+   - `result.score` 与改动前**完全一致**（宿舍不进产能分的回归锁）；
+   - `_ensure_sustainable_morale_cycle` 在 M1 输出上仍然通过（不需要它再"救场"）。
+5. `generate` 端到端 243/333/342 各跑一次 exit 0，`cycleHours ≤ 168`。
+
+**风险 / 陷阱**
+
+- 宿舍价值与心情审计必须用**同一套** rate 函数，否则 beam 认为「很划算」而审计认为「不够」，
+  §8 的 `cycle_exceeds_seven_days`/`morale_balance_deficit` 会在 `generate` 里炸。
+- `_ensure_sustainable_morale_cycle` 仍会**改写**计划（错峰展开）：M1 之后它应该基本不触发；
+  如果它还在频繁触发，说明宿舍 beam 的目标没对齐审计口径。
+- 图优化器是子类，父类解码改动会继承；改完跑 `tests/test_graph_optimizer.py`，
+  注意 `_closure_override` / 候选缓存的失效（§8 第 3 条）。
+- 别把宿舍放进 `_room_specs_for_targets`（:2857）的目标枚举里 —— 那会污染目标选择分。
+
+**工作量**：约一个完整窗口。`optimizer.py` 改 4 处 + 新增 1-2 个函数（约 150-250 行），
+新增 4-5 个测试，然后 1 次全量测试 + 1 次 4 场景基准 + 1 次 16 组扫描。
 
 ### 第 5 步（之后）：办公室选人
 
@@ -405,6 +456,8 @@ top16 召回 1.0。**规律：搓玉目标稳赢、不搓玉目标稳输**（243
 
 ## 8. 陷阱清单
 
+- **下一步是 §3 第 4 步**（宿舍变一等分配目标）。动手前先读那一节的「背景变了」——
+  可行性已经不是瓶颈，别按旧动机去改。
 - `optimize()` 现在会因心情门槛抛 `ValueError`；`recommend` 会把它记为 skipped candidate，
   CLI `generate` 会直接崩 —— 写新代码时记得 try/except。
 - `_apply_pure_gold_drone_cycle_repeats` 里必须同时尊重 `MAX_CYCLE_HOURS`（168h），
