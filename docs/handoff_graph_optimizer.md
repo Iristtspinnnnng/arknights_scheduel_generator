@@ -17,10 +17,11 @@
   三个「单体宿舍恢复的锁定语义」「菲亚梅塔＝自给自足特殊节点」「252/342 基准记录」，
   以及最新的「M1：宿舍一等分配」（`git log` 可见，内容见 §3 第 4 步与 §5）。
 - **§3 第 1、2、4 步已完成**：
-  - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 现在是 `version: 3`）；
+  - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 3 → 现在是 `version: 4`）；
   - 宿舍补上绿字（`0.0004 × 氛围`）、在岗减耗按作用域解析、控制中枢 −0.05/h × 在岗人数；
   - 单体宿舍恢复（`dorm_rec_single`，26 条）按「锁定最低心情舍友直到回满」的语义启用；
   - 菲亚梅塔「自律」按「恢复自给自足的特殊节点」建模（图侧只标注、不加特征）；
+  - 菲亚梅塔「患难之交」按**手动心情重置**建模（转移盈余，不做前一位，`hardshipSwaps`）；
   - **252/342 现在全部可行**（16/16 组合通过，最差收支 +4.0）；
   - **宿舍是一等分配目标（M1）**：整条排班一次 beam（两套目标）+ 旧贪心三候选，
     用心情审计自己的账本 `(门槛, 最差收支, 总恢复)` 择优。产能分一格没动，
@@ -122,7 +123,19 @@ L5 + 氛围 5000 ⇒ 0→24 恰好 **6 小时**，这就是「六小时回满」
    图侧在 `graph_features.meta["specialMoraleNodes"]` 里标注（`graph-audit` 的
    `specialMoraleNodes` 可见），但**不加 GCN 特征**——它只影响心情可行性、对产能读出层没有梯度，
    加了反而是噪声，还会白白让读出层缓存失效。
-   「患难之交」（满心情换心情）按用户要求**先不管**，仍是未建模项。
+6. **菲亚梅塔「患难之交」（`dorm_exchangeAp[000]`）** —— 已建模为**手动心情重置**（审计 `version: 4`）。
+   技能原文是「进驻宿舍时，如果自身为满心情，则与当前宿舍**前一位**进驻的干员互换心情」，
+   但玩家会**有意手动**把她换进宿舍再换出（随时可以手动调宿舍），所以按用户要求
+   **完全不建模「前一位/后一位」**，只当一种特殊心情重置：
+   `morale._apply_hardship_swaps` 把「有宿舍床位、且自己先够用」的持有者的**盈余**
+   （`recovery − consumption`）转给全周期最缺心情的干员，`min(盈余, 对方缺口)`；
+   记账是**转移而不是凭空生成**：接收方 `recovery += x`、持有者 `consumption += x`，
+   所以周期总收支不变、持有者不会被拖成负数。审计新增 `hardshipSwaps` 字段（空列表表示没触发），
+   `assumptions` 加了一条说明「不做前一位」。
+   **现状**：机制已建模，但**解码器还不会主动去用**——M1 的宿舍价值模型里她只是一个普通舍友
+   （没有 all/self 加成），所以 beam 不会为她腾床位；满练表上 16 组扫描与 4 场景基准里
+   她从没被安排进宿舍，`hardshipSwaps` 一直是空，**基准数字不受影响**。
+   要让它真正生效，需要把「持有者的盈余是**可转移**的」写进宿舍价值模型（见 §3 第 6 步）。
 
 ### 2.3 为什么我上一轮加了 4.0/h 下限却全线失败（历史记录，别重复踩）
 
@@ -179,6 +192,31 @@ source_index = ((plan_index + group_count - 1 - group_index) // group_count) % l
 同一班次里所有干员**同一刻上、同一刻下**；`_ensure_sustainable_morale_cycle` 的错峰展开也只是
 把计划数乘成 `base × group_count`，时刻仍沿用同一套网格。没有「某个干员提前 2 小时下班」这种
 个体化换班。若以后要做（Mower 那种逐人换班），需要给 `ShiftPlan` 增加「每人区间」而不是一个 clock。
+
+### 2.7 校准缺陷：O_DIAMOND 贸易站对干员**免疫**（搓玉零梯度的真正原因）
+
+之前把它写成「合成玉贸易站是零梯度房间（guide 刊例固定 132%）」——那是**现象**，不是原因。
+真正的原因是 `production.py::guide_orundum_trade_lookup`：它对**任何** L3 `O_DIAMOND` 房间都命中
+（只检查 `target` 与 `room_level`），然后把速度**强行覆盖**成 `paperEfficiencyPercent = 132`
+（`production.py:955-969`），干员技能完全不参与。于是：
+
+| 口径 | 4750 个 `TRADING/O_DIAMOND` 组合的 orundum |
+| --- | --- |
+| `calibration_profile="guide"`（默认） | **全部 282.000**（1 种取值） |
+| 不走 guide 查表（`raw`） | 200 ~ 220（有梯度） |
+
+这就是读出层对 O_DIAMOND 的 holdout R² = −110 的来源：**标签本身是常数**。
+但游戏里不是这样——`源石订单`（2 源石碎片 → 20 合成玉、2 小时/单）的**获取效率**由贸易站干员
+生产力决定，`源石碎片` 的产出由制造站「源石类配方」的生产力决定。所以搓玉**是**吃干员技能的，
+现在这套模型把其中一半（贸易侧）抹平了。复现脚本：`tools/probe_shard_and_hardship.py`。
+
+修法（**校准改动，必须先定口径再动**）：
+1. 保留 132% 这个锚点当「参照三人的纸面效率」，但让**实际速度**参与订单吞吐
+   （即走 `trade_order_profile` + `room_speed_multiplier` 的同一条路，而不是覆盖 speed）；
+2. 用参照组合反解 `ORUNDUM_ORDER_SECONDS`/每单期望，使参照组合仍能复现 282/天，
+   这样历史搓玉数字的可比性只用**一个常数**维持；
+3. 改完必须重跑：`tests/test_production.py` 的校准用例、4 场景基准、16 组扫描，
+   并把 §5 的两张表重记（搓玉分数会变），同时确认混合算法也按新口径打分（两边同口径才可比）。
 
 ---
 
@@ -402,6 +440,46 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 也不吃中枢 `control_hire_spd`。改法：让 HIRE/MEETING 也走
 `_score_room_combo` → `room_output_score`（`ROOM_EFFICIENCY_SCORED_ROOM_TYPES` 已包含它们），
 即把它们加入 `_assign_room` 的 `_best_room_combo` 分支。
+实测量级：342 不搓玉里办公室 46% vs 43.5% 只值 0.08 分、`roomEfficiency` 差 0.77 分，
+占 −21 分差距的 3.7% —— 先做第 6 步，这一步顺手改即可。
+
+### 第 6 步：生产房间做成图节点，与干员节点做匹配（M3，规划中）
+
+**动机（用户提出，已被实测证实）。** 现在 `graph_optimizer` 的做法是「每间房独立出一张短名单，
+再按房序逐个挑人」。这不是联合优化，只是把局部搜索换了个壳：
+`tools/diff_normal_base_decode.py` 在 342 不搓玉上量到，graph 的 `trading_2` 最终选的是
+**它自己短名单的第 56 名**（预测 44.72），因为前面的房间已经把 top 组合的成员拿走了。
+短名单本身是好的（`TRADING/O_GOLD` 的 61.645 就在短名单第 1 名，top16 召回 1.0），
+坏在**按预测分逐房贪心** —— 这正是用户当初上 graph 想避免的局部最优。
+
+**目标形态。** 把每间生产房间也建成图节点（房型 + 目标 + 等级 + 工位 + 邻居关系），
+与干员节点做**二部匹配**：`score(room_node, operator_node)` 由同一套读出层给出
+（现在的 `RoomValueModel` 的一元项天然就是 `(room, operator)` 亲和度），
+再对「房间 × 工位」做**全局匹配/beam**，让「谁去哪间房」在一个目标下一起决定，
+而不是按房序吃人。
+
+**分三期，每期都能独立验收：**
+
+1. **M3a 精确重排（先做，最小改动、直接打掉上面那个病）**
+   `_candidate_production_room_assignments` 里把短名单的 **top-K（K≈8）** 用
+   `_score_room_combo`（模拟器精确分，有缓存）重排后再进 beam。
+   预期成本：每房 K 次模拟器调用（远小于穷举 4638），墙钟 +10~20%。
+   验收：16 组扫描最差收支不退、分数不降；342/243/252 三个不搓玉场景看能不能吃回一半差距。
+2. **M3b 房间节点 + 亲和度矩阵**
+   `graph_features` 增加房间节点（房型/目标/等级/工位 + 与发电站、控制中枢的边）；
+   读出层的输入从「组合特征」改成「room 节点 embedding × operator 节点 embedding」的点积/注意力，
+   标签仍是 `ProductionSimulator` 的精确分。这样同一张表可以给任意房间-干员对打分。
+3. **M3c 全局匹配解码**
+   把「房间 × 工位」建成二部图上的分配问题（每工位一个算子），用 beam/匈牙利近似；
+   边界约束（相邻班次不重复）作为硬约束，心情账本作为软惩罚进 beam 的 tie-break，
+   而不是事后否决。
+
+**先决条件：** 第 2.7 节的 `O_DIAMOND` 校准必须先修，否则搓玉侧的房间节点是常数值，
+匹配再准也没用（那半边房间对干员完全免疫）。
+
+**风险：** 读出层一旦改成配对打分，`graph_signature` 会变 → 磁盘缓存失效、需要重新拟合
+（几分钟）；`docs/graph_optimizer.md` §6 记的「短名单顺序敏感（±3%）」和「样本越多越差」
+两条都要在这个新形态下重测，不能直接沿用旧结论。
 
 ---
 
@@ -410,6 +488,20 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 `tools/scan_m1_dormitory.py`（本轮新增，**没有删**）：跑 布局 × 模式 × 班次 的组合，
 打印分数、`cycleHours`、最差收支、宿舍等级、总恢复与耗时，并把明细写成 JSON。
 默认就是下面这 16 组；`--layouts/--modes/--shift-patterns` 可以只跑子集。
+
+不搓玉差距的诊断（第 6 步用过的）：`tools/diff_benchmark_case.py`（基准 JSON 逐房间差分）、
+`tools/summarize_case_deltas.py`（四个场景的 ΔlmdGross/Δexp/ΔroomEfficiency）、
+`tools/diff_normal_base_decode.py`（两个优化器**基础解码层**的逐房间精确分对比 + 短名单命中）、
+`tools/check_shortlist_coverage.py`（短名单是否覆盖穷举最优）、
+`tools/check_shortlist_ranking.py`（短名单名次 vs 精确分）。
+
+```
+outputs/normal_gap_summary.md      四个场景的分数构成差异
+outputs/normal_gap_342.md          342 不搓玉：四个班次族逐房间差异
+outputs/base_decode_342.md         342 不搓玉：基础解码层差异 + 短名单名次
+outputs/shard_probe.md             O_DIMOND 是否吃干员（guide 全 282 / raw 200~220）
+outputs/hardship_impact.md         四个基准场景是否触发患难之交（否）
+```
 
 ```powershell
 python tools/scan_m1_dormitory.py --output outputs/scan_m1_dormitory.json
@@ -584,6 +676,13 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
 - **宿舍分配不能只最大化总恢复**：单目标会让 252/342 的 2×12 最差收支从 7.2 掉到 6.0
   （总恢复反而略高）。现在用三候选 + 审计账本 `(门槛, 最差收支, 总恢复)` 字典序择优；
   改目标函数时一定要重跑 §4 的扫描看 `worstBalance` 有没有掉。
+- **不要再说「合成玉贸易站是零梯度房间」**（`docs/graph_optimizer.md` §6 已更正）：零梯度来自
+  `guide_orundum_trade_lookup` 把速度覆盖成常数 132%（任何 L3 `O_DIAMOND` 都命中），
+  不是数据本身没有信息。修它要先定校准口径，见 §2.7。
+- **患难之交按「手动心情重置」建模，不要退回「前一位」**：`morale._apply_hardship_swaps` 只转移
+  盈余（`recovery − consumption`）、记在 `consumption += x` 上，所以总收支不变、持有者不会被拖成负数。
+  审计 `version: 4` 新增 `hardshipSwaps`；`test_morale.py::HardshipSwapTest` 5 个用例锁住这些性质。
+  解码器目前**不会主动为她腾床位**（宿舍价值模型里她只是普通舍友），要让它生效得先改价值模型。
 - `optimize()` 现在会因心情门槛抛 `ValueError`；`recommend` 会把它记为 skipped candidate，
   CLI `generate` 会直接崩 —— 写新代码时记得 try/except。
 - `_apply_pure_gold_drone_cycle_repeats` 里必须同时尊重 `MAX_CYCLE_HOURS`（168h），

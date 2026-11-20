@@ -639,6 +639,126 @@ class MoraleModelEffectsTest(unittest.TestCase):
         )
 
 
+class HardshipSwapTest(unittest.TestCase):
+    """患难之交 = 手动心情重置（不做「前一位」，也不凭空造心情）。
+
+    用户观察：玩家会**有意手动**把菲亚梅塔换进宿舍再换出去，所以这个技能在任何时刻
+    都可以用；真正需要建模的是「把某个干员回满、并占用那段时间的宿舍空位」，
+    而不是「与当前宿舍前一位进驻的干员互换」这个房间顺序。
+    """
+
+    HARDSHIP = "进驻宿舍时，如果自身为满心情，则与当前宿舍前一位进驻的干员互换心情"
+    FATIGUE = "进驻制造站时，心情每小时消耗+0.5"
+
+    def test_reset_lifts_the_neediest_operator_to_break_even(self) -> None:
+        plan = [
+            shift("A", "08:00", 12.0, working=["连续值班"], resting=["陪住乙", "菲亚梅塔"],
+                  descriptions={"菲亚梅塔": self.HARDSHIP}),
+            shift("B", "20:00", 12.0, working=["连续值班"], resting=["陪住乙", "菲亚梅塔"],
+                  descriptions={"菲亚梅塔": self.HARDSHIP}),
+        ]
+
+        audit = audit_morale_cycle(dormitory_layout(), plan)
+
+        # 连续值班：消耗 24 / 恢复 0；把 24 点转过去恰好拉回 0。
+        self.assertEqual(audit["hardshipSwaps"], [
+            {
+                "holder": "菲亚梅塔",
+                "target": "连续值班",
+                "amount": 24.0,
+                "kind": "manual_morale_reset",
+            }
+        ])
+        ledger = audit["moraleLedgerByOperator"]
+        self.assertAlmostEqual(ledger["连续值班"]["balance"], 0.0)
+        self.assertAlmostEqual(ledger["菲亚梅塔"]["consumption"], 24.0)
+        self.assertAlmostEqual(
+            ledger["菲亚梅塔"]["balance"],
+            ledger["菲亚梅塔"]["recovery"] - ledger["菲亚梅塔"]["consumption"],
+        )
+        self.assertTrue(audit["hardGatePassed"], audit["failureReasons"])
+
+    def test_without_the_holder_the_same_plan_still_fails(self) -> None:
+        plan = [
+            shift("A", "08:00", 12.0, working=["连续值班"], resting=["陪住乙"]),
+            shift("B", "20:00", 12.0, working=["连续值班"], resting=["陪住乙"]),
+        ]
+
+        audit = audit_morale_cycle(dormitory_layout(), plan)
+
+        self.assertEqual(audit["hardshipSwaps"], [])
+        self.assertFalse(audit["hardGatePassed"])
+        self.assertIn("morale_balance_deficit", audit["failureReasons"])
+
+    def test_transfer_moves_morale_instead_of_creating_it(self) -> None:
+        with_holder = [
+            shift("A", "08:00", 12.0, working=["连续值班"], resting=["陪住乙", "菲亚梅塔"],
+                  descriptions={"菲亚梅塔": self.HARDSHIP}),
+            shift("B", "20:00", 12.0, working=["连续值班"], resting=["陪住乙", "菲亚梅塔"],
+                  descriptions={"菲亚梅塔": self.HARDSHIP}),
+        ]
+        without_holder = [
+            shift("A", "08:00", 12.0, working=["连续值班"], resting=["陪住乙"]),
+            shift("B", "20:00", 12.0, working=["连续值班"], resting=["陪住乙"]),
+        ]
+
+        gifted = audit_morale_cycle(dormitory_layout(), with_holder)
+        plain = audit_morale_cycle(dormitory_layout(), without_holder)
+        gifted_total = sum(
+            item["balance"] for item in gifted["moraleLedgerByOperator"].values()
+        )
+        plain_total = sum(
+            item["balance"] for item in plain["moraleLedgerByOperator"].values()
+        )
+        holder = gifted["moraleLedgerByOperator"]["菲亚梅塔"]
+
+        self.assertAlmostEqual(gifted_total, plain_total + holder["recovery"])
+        self.assertAlmostEqual(holder["consumption"], 24.0)
+
+    def test_holder_without_a_dormitory_seat_cannot_reset(self) -> None:
+        plan = [
+            shift("A", "08:00", 12.0, working=["连续值班", "菲亚梅塔"], resting=["陪住乙"],
+                  descriptions={"菲亚梅塔": self.HARDSHIP}),
+            shift("B", "20:00", 12.0, working=["连续值班", "菲亚梅塔"], resting=["陪住乙"],
+                  descriptions={"菲亚梅塔": self.HARDSHIP}),
+        ]
+
+        audit = audit_morale_cycle(dormitory_layout(), plan)
+
+        self.assertEqual(audit["hardshipSwaps"], [])
+
+    def test_capacity_is_limited_by_her_own_surplus(self) -> None:
+        # 她只在班次 A 有床位（12h × 2.0/h = 24），班次 B 还要上班（消耗 12），
+        # 盈余只有 12，而缺口是 36：只能给出 12，不能把她拖成负数。
+        plan = [
+            shift(
+                "A",
+                "08:00",
+                12.0,
+                working=["连续值班"],
+                resting=["菲亚梅塔"],
+                descriptions={"菲亚梅塔": self.HARDSHIP, "连续值班": self.FATIGUE},
+            ),
+            shift(
+                "B",
+                "20:00",
+                12.0,
+                working=["连续值班", "菲亚梅塔"],
+                descriptions={"菲亚梅塔": self.HARDSHIP, "连续值班": self.FATIGUE},
+            ),
+        ]
+
+        audit = audit_morale_cycle(entry_level_dormitory_layout(), plan)
+
+        transfer = audit["hardshipSwaps"][0]
+        self.assertEqual(transfer["amount"], 12.0)
+        holder = audit["moraleLedgerByOperator"]["菲亚梅塔"]
+        target = audit["moraleLedgerByOperator"]["连续值班"]
+        self.assertAlmostEqual(holder["balance"], 0.0)
+        self.assertAlmostEqual(target["balance"], -24.0)
+        self.assertFalse(audit["hardGatePassed"])
+
+
 def dormitory_layout(levels: tuple[int, ...] = (5, 5, 5, 5)) -> Layout:
     return Layout(
         "243",

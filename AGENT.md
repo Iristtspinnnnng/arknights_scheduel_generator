@@ -163,12 +163,20 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
   目标=进入宿舍时心情最低的舍友（除自身以外），回满或离开才移交，不要改成每帧重算。
   菲亚梅塔「自律」是**恢复自给自足的特殊节点**：只按自身 +2/h，不接任何其他恢复源，
   图侧标注在 `graph_features.meta["specialMoraleNodes"]`（不加 GCN 特征）。
+  菲亚梅塔「患难之交」按**手动心情重置**建模（审计 `version: 4` 的 `hardshipSwaps`）：
+  持有者的**盈余**（recovery − consumption）转给最缺心情的干员，接收方 recovery += x、
+  持有者 consumption += x（转移不生成，总收支不变）；**不要**回去建模「前一位/后一位」。
   在岗消耗 = 1/h + 自身/房间/中枢/全基建技能修正，`max(0, ·)`；
   控制中枢每名在岗干员让**所有在岗**干员消耗 −0.05/h（`controlData.basicCostBuff = -5`）；
   周期可持续 ⟺ 每人一周期 `潜在恢复 − 消耗 ≥ 0`。别再写回「末值 vs 初值」的判定。
   换班仍是**批量固定时刻**（一个 `ShiftPlan` 一个 `start`，全员同时上下班）。
   发电站数量→电力→宿舍等级→恢复率**已建模**（`power.resolve_power_layout`，252/342 会落到
   `(1,1,1,2)`，恢复率 2.0~2.5/h）。
+- **搓玉口径的已知缺陷**：`production.guide_orundum_trade_lookup` 对任何 L3 `O_DIAMOND` 房间都命中，
+  并把速度覆盖成常数 132%（干员不参与），所以模型里合成玉贸易站是**零梯度**的——
+  4750 个组合全 282.000，raw 口径才是 200~220。真实游戏里源石订单吞吐吃贸易站干员生产力、
+  源石碎片产出吃制造站「源石类配方」生产力，所以这是**我们自己的校准覆盖**造成的，不是游戏事实。
+  修它要先定参照口径并重记基准（handoff §2.7）。
 - 宿舍分配口径（M1，2026-11）：宿舍是**一等分配目标**。`_assign_dormitory_quarters` 对**整条排班**
   跑一次 beam（`deficit` 先补缺口 / `recovery` 先最大化总恢复）+ 旧贪心共三个候选，
   用心情审计自己的账本 `(hardGatePassed, 最差收支, 总恢复)` 择优，所以不会比旧贪心差。

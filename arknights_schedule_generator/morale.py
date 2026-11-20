@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from .models import Layout, ShiftPlan
 from .skill_rules import self_contained_recovery_rate
@@ -27,8 +27,13 @@ DORMITORY_COMFORT_PER_LEVEL = 1000.0
 COMFORT_RECOVERY_PER_POINT = 0.0004
 #: building_data.controlData.basicCostBuff is -5 (1/100 units) per stationed operator.
 CONTROL_MORALE_RELIEF_PER_OPERATOR = 0.05
+#: ``dorm_exchangeAp``: 进驻宿舍时，如果自身为满心情，则与当前宿舍前一位进驻的干员互换心情。
+#: Modelled as a manual **morale reset** (the player rotates her in on purpose), not as a
+#: room order: she is full, hands her morale to whoever needs it most, and refills from
+#: the dormitory she occupies. See :func:`_apply_hardship_swaps`.
+HARDSHIP_SWAP_MARKER = "互换心情"
 
-AUDIT_VERSION = 3
+AUDIT_VERSION = 4
 
 
 def active_operator_names(shift: ShiftPlan) -> set[str]:
@@ -88,6 +93,7 @@ def audit_morale_cycle(layout: Layout, shifts: list[ShiftPlan]) -> dict[str, Any
 
     start_morale = {name: MAX_MORALE for name in all_names}
     trace = _simulate_cycle(layout, shifts, start_morale)
+    hardship_swaps = _apply_hardship_swaps(trace, _hardship_swap_holders(shifts))
     balance = {
         name: trace.recovery.get(name, 0.0) - trace.consumption.get(name, 0.0)
         for name in all_names
@@ -180,6 +186,7 @@ def audit_morale_cycle(layout: Layout, shifts: list[ShiftPlan]) -> dict[str, Any
         "transitions": transitions,
         "steadyState": _steady_state(layout, shifts, start_morale),
         "unmodelledMoraleEffects": _collect_unmodelled_morale_effects(shifts),
+        "hardshipSwaps": hardship_swaps,
         "assumptions": [
             "On-duty consumption is 1 morale per hour, adjusted by self, room-wide, "
             "control-centre and base-wide morale skills, and floored at 0.",
@@ -193,6 +200,9 @@ def audit_morale_cycle(layout: Layout, shifts: list[ShiftPlan]) -> dict[str, Any
             "then moves on; its owner is never the target.",
             "An operator whose recovery cannot come from other sources (自律) only recovers "
             "its own rate in a dormitory and never receives neighbour bonuses.",
+            "患难之交 is modelled as a manual morale reset: the holder (in a dormitory) hands "
+            "her surplus recovery to the most deficient operator; the transfer moves morale "
+            "rather than creating it, and the 前一位 order is not modelled.",
             "A cycle is sustainable when every operator's potential recovery covers its consumption.",
             "Recovery booked while an operator is already at 24 morale is counted as potential recovery only.",
             "Reported minimum and ending morale come from one cycle that starts at 24 morale for everyone.",
@@ -354,6 +364,85 @@ def _same_effect_max(values: Any) -> float:
     if not numbers:
         return 0.0
     return min(numbers) if all(value < 0.0 for value in numbers) else max(numbers)
+
+
+def _hardship_swap_holders(shifts: list[ShiftPlan]) -> list[str]:
+    """Dormitory occupants whose skill is ``患难之交``（互换心情）.
+
+    Only operators with a dormitory seat can use it, because the swap needs her to be
+    stationed and full; the seat is what she refills from afterwards.
+    """
+    holders: set[str] = set()
+    for shift in shifts:
+        for room in shift.dormitories:
+            for skill in room.operators:
+                plain = re.sub(r"<[^>]+>", "", skill.description or "")
+                if HARDSHIP_SWAP_MARKER in plain:
+                    holders.add(skill.operator_name)
+    return sorted(holders)
+
+
+def _apply_hardship_swaps(
+    trace: _CycleTrace,
+    holders: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Model ``患难之交`` as a manual morale reset instead of a room order.
+
+    Why a reset and not "swap with whoever entered the dormitory last": players rotate
+    Fiammetta in **on purpose** and can rearrange dormitories at any time, so the useful
+    abstraction is *"one operator gets refilled to full, and the seat it took is hers"*.
+    The order rule (``前一位``) is deliberately not modelled.
+
+    Accounting (closed-form, so it composes with the balance-sheet verdict):
+
+    * a holder needs a dormitory seat and must be able to cover her own consumption
+      first, so her capacity is ``recovery - consumption`` (she cannot give away morale
+      she never recovers);
+    * the recipient is the operator with the largest remaining cycle deficit -- the
+      player picks the target manually, and this is the rational choice;
+    * the transfer moves morale, it does not create it: the recipient's recovery goes
+      up and the holder's consumption goes up by the same amount, so the cycle's total
+      balance is unchanged and nobody can be pushed below zero by donating.
+
+    Returns the booked transfers for the audit report.
+    """
+    if not holders:
+        return []
+    deficits = {
+        name: trace.consumption.get(name, 0.0) - trace.recovery.get(name, 0.0)
+        for name in set(trace.consumption) | set(trace.recovery)
+    }
+    transfers: list[dict[str, Any]] = []
+    for holder in holders:
+        capacity = (
+            trace.recovery.get(holder, 0.0) - trace.consumption.get(holder, 0.0)
+        )
+        if capacity <= MORALE_BALANCE_TOLERANCE:
+            continue
+        candidates = [
+            name
+            for name, deficit in deficits.items()
+            if name != holder and deficit > MORALE_BALANCE_TOLERANCE
+        ]
+        if not candidates:
+            continue
+        target = max(candidates, key=lambda name: (deficits[name], name))
+        move = min(capacity, deficits[target])
+        if move <= MORALE_BALANCE_TOLERANCE:
+            continue
+        trace.recovery[target] = trace.recovery.get(target, 0.0) + move
+        trace.consumption[holder] = trace.consumption.get(holder, 0.0) + move
+        deficits[target] -= move
+        deficits[holder] = deficits.get(holder, 0.0) + move
+        transfers.append(
+            {
+                "holder": holder,
+                "target": target,
+                "amount": round(move, 6),
+                "kind": "manual_morale_reset",
+            }
+        )
+    return transfers
 
 
 def _collect_unmodelled_morale_effects(shifts: list[ShiftPlan]) -> list[str]:
@@ -783,5 +872,6 @@ def _failed_audit(
             "tolerance": MORALE_STATE_TOLERANCE,
         },
         "unmodelledMoraleEffects": [],
+        "hardshipSwaps": [],
         "assumptions": [],
     }
