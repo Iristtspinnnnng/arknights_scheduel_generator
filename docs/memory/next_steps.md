@@ -1231,3 +1231,68 @@ Traps worth remembering:
   remove it; that is handoff step 3 (rotation table).
 
 
+## P16 - O_DIAMOND Calibration v2 (orundum trade post is no longer operator-blind)
+
+Handoff section 3 step 7. Before this pass, `production.guide_orundum_trade_lookup` matched **any**
+level-3 `O_DIAMOND` room and overwrote the room speed with a constant `132%`, so every one of the 4750
+`TRADING/O_DIAMOND` combos produced exactly 282.000 orundum per 12h. That constant label is why the graph
+readout layer scored a holdout R^2 of -110.6 on that room.
+
+What changed (production.py):
+
+- The lookup table, `guide_orundum_trade_lookup` and its skill-effect audit are **deleted**. O_DIAMOND now
+  goes through the same `trade_order_profile` + `room_speed_multiplier` path as LMD orders, with
+  `speed_percent` coming only from the stationed operators.
+- O_DIAMOND is **never clipped by the static order limit** (`bounded_by_order_limit = target != "O_DIAMOND"`).
+  Shard supply is the real constraint, and clipping would flatten every speed above +32% into 200 orundum.
+- One calibration constant, `ORUNDUM_ORDER_THROUGHPUT_SCALE`, derived from `ORUNDUM_REFERENCE_*` so the
+  reference room (level 3 / 3 slots / +132% speed / 12h) stays at exactly **282.000**. It currently equals
+  1.0. The old handoff note claiming `r ~ 1.728` was an arithmetic slip (it assumed the reference was +32%).
+- `calibration.expected_trading` mirrors the change; `trade_model_summary()["orundumOrder"]` documents v2.
+- Caches invalidated: `graph_cache.CACHE_SCHEMA_VERSION` 2 -> 3, `optimizer.OPTIMIZER_MODEL_VERSION` 22 -> 23.
+
+Measured (`tools/measure_orundum_anchor.py`, `outputs/orundum_anchor.md`):
+
+| metric | v1 | v2 |
+| --- | --- | --- |
+| 4750 combos, 12h orundum | all 282.000 | 123.6 .. 339.6 |
+| readout holdout R^2 | -110.6 | 0.753 (Spearman 0.30 -> 0.94) |
+| guide vs raw | different paths | identical |
+
+Two structural defects surfaced once the room had a real gradient, both fixed in the same pass:
+
+1. **Stagger-expansion cycle length is a step cost.** `fastRotationRooms` (rooms with an operator whose
+   skill adds hourly morale consumption) are excluded from the stagger pool in bulk, so one +2.0/h operator
+   in the Meeting Room pushed `groupCount` from 2 to 3 and the cycle from 48h to 72h - i.e. daily score
+   divided by 3 (333 balanced-orundum 3x8: 434.5 vs hybrid 514.6). New
+   `optimizer._relieve_morale_rotation_pressure` swaps those operators out before expanding, and keeps the
+   swap **only if it actually lowers the group count**. `_morale_rotation_plan` is now the single shared
+   estimate for both the expansion and the repair. Score recovered to 492.6 (-15.57% -> -4.28%); the
+   243 normal 3x8 cycle also went 72h -> 48h.
+2. **The shortlist could under-fill a room.** `_variant_options` is built from the *unexcluded* candidate
+   pool, so after excluding a batch of operators the surviving pool may contain names that have no variant
+   entry. `rank_combinations(capacity=min(capacity, len(names)))` then filled the room with 1-2 people; v1's
+   constant label hid this completely (an empty room still produced 282). Now `graph_optimizer._room_combos`
+   falls back to the parent's exhaustive enumeration when `0 < len(names) < capacity`; when `names` is empty
+   it still returns an empty shortlist and lets the caller's per-operator greedy fill the room (that branch
+   measured better on 342 normal: 681.9 vs 659.7).
+
+Benchmarks after the pass (`outputs/benchmark_orundumv2`, `outputs/benchmark_252_342_orundumv2`):
+
+| scenario | hybrid | graph | delta |
+| --- | --- | --- | --- |
+| 243 balanced-orundum 2x12 | 402.525 | 402.525 | 0.00% |
+| 243 normal 2x12 | 605.566 | 603.177 | -0.39% |
+| 333 balanced-orundum 3x8 auto | 514.645 | 492.625 | -4.28% |
+| 333 max-orundum 2x12 auto | 486.179 | 485.711 | -0.10% |
+| 252 balanced-orundum 2x12 | 435.225 | 435.225 | 0.00% |
+| 252 normal 2x12 | 646.577 | 644.897 | -0.26% |
+| 342 balanced-orundum 2x12 | 576.744 | 580.903 | +0.72% |
+| 342 normal 2x12 | 680.768 | 681.893 | +0.17% |
+
+So "graph wins on orundum, loses on normal" is **no longer the rule**: 342 normal now wins. The remaining
+small losses are the per-room greedy problem (handoff section 3 step 6, M3).
+
+Tests: 276 passed / 1 skipped / 1 pre-existing environment failure (missing local yituliu asset).
+New: 3 orundum calibration tests, 4 rotation-repair tests, 1 shortlist-fill regression test.
+Next step: M3a (exact re-ranking of the shortlist top-K).

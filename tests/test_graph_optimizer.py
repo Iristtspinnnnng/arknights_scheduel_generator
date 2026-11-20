@@ -44,7 +44,7 @@ from arknights_schedule_generator.graph_optimizer import (
     GraphScheduleOptimizer,
 )
 from arknights_schedule_generator.models import RosterOperator
-from arknights_schedule_generator.optimizer import ScheduleOptimizer, parse_layout
+from arknights_schedule_generator.optimizer import RoomSpec, ScheduleOptimizer, parse_layout
 from arknights_schedule_generator.roster import load_roster_xlsx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -683,6 +683,31 @@ class RealDataGraphTest(unittest.TestCase):
         self.assertEqual(graph.meta["specialMoraleNodes"], report["specialMoraleNodes"])
         # 标注不参与 GCN 特征宽度，避免无谓地让读出层缓存失效。
         self.assertEqual(report["featureWidth"], len(FEATURE_NAMES))
+
+    def test_real_shortlist_still_fills_a_room_after_the_top_pool_is_excluded(self) -> None:
+        """排除掉「无排除池」的头部之后，短名单不能把房间填成 1 人。
+
+        技能的变体表是按无排除候选池建的，所以被排除之后池子里剩下的干员大多不在那张表里；
+        v1 的 O_DIAMOND 常数标签把「房间只填 1 人」掩盖成满产，v2 之后它直接掉分
+        （333 平衡搓玉 3×8 实测 −144 分）。这条锁住「退回全量枚举」的兜底：
+        只要变体表里还剩 1 个人（`0 < len(names) < capacity`），就必须枚举出满员组合。
+        """
+        graph = GraphScheduleOptimizer(self.game_data, self.roster, shard_formula="rock")
+        # 用 2 工位的合成玉贸易站，让全量枚举保持便宜（C(32,2)）。
+        spec = RoomSpec("trading_1", "TRADING", "O_DIAMOND", 2, 2, 2)
+        pool = [
+            candidate.skill.operator_name
+            for candidate in graph._combo_candidate_pool("TRADING", "O_DIAMOND", set())
+        ]
+        # 只留 1 个「变体表里有人」的干员，其余全部排除。
+        kept = pool[-1]
+        excluded = {name for name in pool if name != kept}
+
+        available = graph._combo_candidate_pool("TRADING", "O_DIAMOND", excluded)
+        self.assertGreaterEqual(len(available), spec.capacity)
+        combos = graph._room_combos(spec, excluded, 12.0)
+        self.assertTrue(combos)
+        self.assertEqual({len(combo.operators) for combo in combos}, {spec.capacity})
 
     def test_real_optimizer_keeps_guide_mechanism_trio(self) -> None:
         """图短名单必须包含刊例表里 200% 那一行的三人组。"""

@@ -172,11 +172,13 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
   换班仍是**批量固定时刻**（一个 `ShiftPlan` 一个 `start`，全员同时上下班）。
   发电站数量→电力→宿舍等级→恢复率**已建模**（`power.resolve_power_layout`，252/342 会落到
   `(1,1,1,2)`，恢复率 2.0~2.5/h）。
-- **搓玉口径的已知缺陷**：`production.guide_orundum_trade_lookup` 对任何 L3 `O_DIAMOND` 房间都命中，
-  并把速度覆盖成常数 132%（干员不参与），所以模型里合成玉贸易站是**零梯度**的——
-  4750 个组合全 282.000，raw 口径才是 200~220。真实游戏里源石订单吞吐吃贸易站干员生产力、
-  源石碎片产出吃制造站「源石类配方」生产力，所以这是**我们自己的校准覆盖**造成的，不是游戏事实。
-  修它要先定参照口径并重记基准（handoff §2.7）。
+- **搓玉（O_DIAMOND）口径 = 校准 v2（2026-11 已修，别再按旧说法写）**：源石订单的**速度只来自
+  在岗干员技能**，并且**不裁剪订单上限**（真正的约束是源石碎片供给）；绝对量级由单一常数
+  `production.ORUNDUM_ORDER_THROUGHPUT_SCALE`（当前 1.0，由参照点反解）锚住，
+  参照 = L3 / 3 工位 / 技能 +132% / 无中枢加成 / 12h ⇒ **282.000** 合成玉。
+  旧的 `guide_orundum_trade_lookup`（任何 L3 `O_DIAMOND` 都覆盖成 132%）已**删除**：它让 4750 个
+  组合全产出 282.000、读出层 holdout R² = −110。现在同一批组合是 123.6 ~ 339.6，R² ≈ 0.75。
+  改这条要先跑 `tools/measure_orundum_anchor.py` 与两套基准（基准数字会动）。
 - 宿舍分配口径（M1，2026-11）：宿舍是**一等分配目标**。`_assign_dormitory_quarters` 对**整条排班**
   跑一次 beam（`deficit` 先补缺口 / `recovery` 先最大化总恢复）+ 旧贪心共三个候选，
   用心情审计自己的账本 `(hardGatePassed, 最差收支, 总恢复)` 择优，所以不会比旧贪心差。

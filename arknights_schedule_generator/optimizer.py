@@ -70,7 +70,9 @@ DORMITORY_POOL_LIMIT = 40
 DORMITORY_RECOVERY_TIEBREAK = 1e-6
 COMBO_CANDIDATE_TOP_LIMIT = 14
 COMBO_CANDIDATE_POOL_LIMIT = 32
-OPTIMIZER_MODEL_VERSION = 22
+#: 23：O_DIAMOND 校准 v2（速度参与、不裁剪订单上限）→ 搓玉房间的产能分变了，
+#:     旧的 candidate 缓存必须作废，否则 ``recommend`` 会复用旧分数。
+OPTIMIZER_MODEL_VERSION = 23
 LAYOUT_ROOM_COUNT_LIMITS = {
     "TRADING": 5,
     "MANUFACTURE": 5,
@@ -2420,39 +2422,18 @@ class ScheduleOptimizer:
             )
         return self._improve_dormitory_anchor_coverage(rebuilt)
 
-    def _ensure_sustainable_morale_cycle(
-        self,
-        layout: Layout,
-        shifts: list[ShiftPlan],
-    ) -> tuple[list[ShiftPlan], dict[str, Any]]:
-        """心情周期硬门槛，同时是宿舍一等分配的**唯一落点**。
+    def _morale_rotation_plan(
+        self, layout: Layout, shifts: list[ShiftPlan]
+    ) -> dict[str, Any]:
+        """错峰展开会用几组、卡在哪：展开与「换人减负」共用的唯一估计入口。
 
-        M1 的宿舍 beam 放在这里而不是解码的每个班次里，原因有两个：
+        口径与 ``_ensure_sustainable_morale_cycle`` 完全一致，两处不许各算一套：
 
-        1. 床位是跨班次共享的稀缺资源（243：4 间 × 5 床 vs 29 个在岗），
-           逐班次看不到「谁整个周期最缺心情」；
-        2. 解码热路径上一次 ``optimize()`` 会重建几百次宿舍，而宿舍不进产能分，
-           在那一层做 beam 只是把墙钟时间乘上几倍（实测 17.7s → 107.6s），
-           对最终排班没有任何影响。
-
-        所以：门槛已经通过时用 beam 升级一次宿舍再复核；没过时先做错峰展开
-       （必休的人是硬约束），再对展开后的整条排班做 beam。
+        - ``roomWeights`` 每间房取「各计划里在岗人数的最大值」（房间是跨计划共享的）；
+        - ``fastRotationRooms`` 是「有干员带心情每小时消耗 +N」的房间，它们的席位
+          整块从错峰容量里扣掉（这些干员需要更频繁地回宿舍）；
+        - ``groupCount = ceil(staggerWeight / staggerCapacity)``，周期 = Σ班次时长 × 组数。
         """
-        audit = audit_morale_cycle(layout, shifts)
-        if audit["hardGatePassed"]:
-            upgraded = self._improve_dormitory_anchor_coverage(
-                self._assign_dormitory_quarters(layout, shifts)
-            )
-            upgraded_audit = audit_morale_cycle(layout, upgraded)
-            if upgraded_audit["hardGatePassed"]:
-                return upgraded, upgraded_audit
-            return shifts, audit
-        if len(shifts) < 2:
-            raise ValueError(
-                "No sustainable morale cycle within seven days: a one-change-per-day "
-                "schedule cannot rotate a fully staffed base through the available dormitories."
-            )
-
         dorm_specs = self._dorm_specs(layout)
         dorm_capacity = sum(spec.capacity for spec in dorm_specs)
         room_order = [room.room_id for room in shifts[0].rooms]
@@ -2478,16 +2459,186 @@ class ScheduleOptimizer:
         fast_rotation_weight = sum(room_weights[room_id] for room_id in fast_rotation_rooms)
         stagger_capacity = dorm_capacity - fast_rotation_weight
         stagger_weight = total_active - fast_rotation_weight
-        if stagger_capacity <= 0 and stagger_weight > 0:
+        group_count = (
+            max(1, (stagger_weight + stagger_capacity - 1) // stagger_capacity)
+            if stagger_weight and stagger_capacity > 0
+            else 1
+        )
+        return {
+            "dormitoryCapacity": dorm_capacity,
+            "roomOrder": room_order,
+            "roomWeights": room_weights,
+            "totalActive": total_active,
+            "fastRotationRooms": fast_rotation_rooms,
+            "fastRotationWeight": fast_rotation_weight,
+            "staggerCapacity": stagger_capacity,
+            "staggerWeight": stagger_weight,
+            "groupCount": group_count,
+            "cycleHours": sum(shift.duration_hours for shift in shifts) * group_count,
+        }
+
+    def _fatiguing_operator_names(self, shifts: list[ShiftPlan]) -> set[str]:
+        return {
+            skill.operator_name
+            for shift in shifts
+            for room in shift.rooms
+            for skill in room.operators
+            if max(0.0, fatigue_delta_from_text(skill.description)) > 0.0001
+        }
+
+    def _relieve_morale_rotation_pressure(
+        self, layout: Layout, shifts: list[ShiftPlan]
+    ) -> list[ShiftPlan]:
+        """展开前把「心情每小时消耗 +N」的干员从房间里换掉，换掉能缩短周期才保留。
+
+        为什么值得做（实测 333 平衡搓玉 3×8）：错峰展开把 ``fastRotationRooms`` 的席位
+        整块从错峰容量里扣掉。会客室里一个 +2.0/h 的干员（见行者）占了 2 个席位，就把
+        ``staggerCapacity`` 从 12 压到 7，把 48h 周期逼成 72h —— 日均分直接除以 3。
+        换掉他的代价只是一间会客室的分数（≤ 10 分），收益是整张表的有效天数 −33%。
+        所以这里只做「换人」，而且**只在确实减少组数时**才保留改动；换不满一屋人就放弃，
+        避免把房间越改越空。
+        """
+        plan = self._morale_rotation_plan(layout, shifts)
+        if plan["groupCount"] < 3 or not plan["fastRotationRooms"]:
+            return shifts
+        fatiguing = self._fatiguing_operator_names(shifts)
+        if not fatiguing:
+            return shifts
+        current = shifts
+        group_count = plan["groupCount"]
+        # 先换权重小的房间：那里的人本来就贡献得少，换掉的分数代价最小。
+        for room_id in sorted(
+            plan["fastRotationRooms"], key=lambda item: (plan["roomWeights"][item], item)
+        ):
+            if group_count <= 2:
+                break
+            candidate = self._replace_fatiguing_room_operators(current, room_id, fatiguing)
+            if candidate is None:
+                continue
+            trial = self._morale_rotation_plan(layout, candidate)
+            if trial["groupCount"] < group_count:
+                current = candidate
+                group_count = trial["groupCount"]
+        return current
+
+    def _replace_fatiguing_room_operators(
+        self,
+        shifts: list[ShiftPlan],
+        room_id: str,
+        fatiguing: set[str],
+    ) -> list[ShiftPlan] | None:
+        """把 ``room_id`` 在**每个班次**里的 +消耗 干员换成人头数相同的一批。
+
+        相邻班次不能重复用同一个人（``_active_boundaries_are_valid`` 的硬约束），
+        所以换进来的人要在本方法内累积去重；换完还必须整体重新过一遍这个约束，
+        过不了就整间房放弃（宁可不动，也不要把排班改成不可用）。
+        """
+        replaced_any = False
+        used: set[str] = set()
+        result: list[ShiftPlan] = []
+        for index, shift in enumerate(shifts):
+            room = next(room for room in shift.rooms if room.room_id == room_id)
+            if not any(skill.operator_name in fatiguing for skill in room.operators):
+                result.append(shift)
+                continue
+            target_count = len(room.operators)
+            boundary = self._boundary_active_names(shifts, index)
+            active_here = {
+                skill.operator_name
+                for other in shift.rooms
+                if other.room_id != room_id
+                for skill in other.operators
+            }
+            replacement = self._assign_room(
+                spec=self._spec_from_assignment(room),
+                excluded=boundary | active_here | fatiguing | used,
+                duration_hours=shift.duration_hours,
+            )
+            if len(replacement.operators) < target_count:
+                return None
+            used.update(skill.operator_name for skill in replacement.operators)
+            result.append(
+                replace(
+                    shift,
+                    rooms=[replacement if item.room_id == room_id else item for item in shift.rooms],
+                )
+            )
+            replaced_any = True
+        if not replaced_any:
+            return None
+        if not self._active_boundaries_are_valid(result):
+            return None
+        return result
+
+    def _dormitory_upgrade_or_keep(
+        self,
+        layout: Layout,
+        shifts: list[ShiftPlan],
+        audit: dict[str, Any],
+    ) -> tuple[list[ShiftPlan], dict[str, Any]]:
+        """门槛已经通过时的收尾：用 beam 升级宿舍，复核通过才采用。
+
+        升级被门槛否决时**保留原排班**（这是 M1 的「不消耗余量」保证）。
+        """
+        upgraded = self._improve_dormitory_anchor_coverage(
+            self._assign_dormitory_quarters(layout, shifts)
+        )
+        upgraded_audit = audit_morale_cycle(layout, upgraded)
+        if upgraded_audit["hardGatePassed"]:
+            return upgraded, upgraded_audit
+        return shifts, audit
+
+    def _ensure_sustainable_morale_cycle(
+        self,
+        layout: Layout,
+        shifts: list[ShiftPlan],
+    ) -> tuple[list[ShiftPlan], dict[str, Any]]:
+        """心情周期硬门槛，同时是宿舍一等分配的**唯一落点**。
+
+        M1 的宿舍 beam 放在这里而不是解码的每个班次里，原因有两个：
+
+        1. 床位是跨班次共享的稀缺资源（243：4 间 × 5 床 vs 29 个在岗），
+           逐班次看不到「谁整个周期最缺心情」；
+        2. 解码热路径上一次 ``optimize()`` 会重建几百次宿舍，而宿舍不进产能分，
+           在那一层做 beam 只是把墙钟时间乘上几倍（实测 17.7s → 107.6s），
+           对最终排班没有任何影响。
+
+        所以：门槛已经通过时用 beam 升级一次宿舍再复核；没过时先做错峰展开
+        （必休的人是硬约束），再对展开后的整条排班做 beam。
+        展开之前还有一次定向修复（``_relieve_morale_rotation_pressure``）：把带
+        「心情每小时消耗 +N」的干员换出房间，只在因此减少组数时保留。
+        """
+        audit = audit_morale_cycle(layout, shifts)
+        if audit["hardGatePassed"]:
+            return self._dormitory_upgrade_or_keep(layout, shifts, audit)
+        if len(shifts) < 2:
+            raise ValueError(
+                "No sustainable morale cycle within seven days: a one-change-per-day "
+                "schedule cannot rotate a fully staffed base through the available dormitories."
+            )
+
+        # 展开之前先做定向修复：会客室里一个 +2.0/h 的干员就能把 48h 周期逼成 72h。
+        relieved = self._relieve_morale_rotation_pressure(layout, shifts)
+        if relieved is not shifts:
+            relieved_audit = audit_morale_cycle(layout, relieved)
+            if relieved_audit["hardGatePassed"]:
+                # 换人之后直接过得去——比任何错峰展开都便宜，收下。
+                return self._dormitory_upgrade_or_keep(layout, relieved, relieved_audit)
+            shifts = relieved
+
+        rotation = self._morale_rotation_plan(layout, shifts)
+        dorm_capacity = rotation["dormitoryCapacity"]
+        room_order = rotation["roomOrder"]
+        room_weights = rotation["roomWeights"]
+        fast_rotation_rooms = rotation["fastRotationRooms"]
+        fast_rotation_weight = rotation["fastRotationWeight"]
+        stagger_capacity = rotation["staggerCapacity"]
+        if stagger_capacity <= 0 and rotation["staggerWeight"] > 0:
             raise ValueError(
                 "No sustainable morale cycle: high-consumption operators exhaust dormitory capacity."
             )
-        group_count = max(
-            1,
-            (stagger_weight + stagger_capacity - 1) // stagger_capacity
-            if stagger_weight
-            else 1,
-        )
+        group_count = rotation["groupCount"]
+
         cycle_hours = sum(shift.duration_hours for shift in shifts) * group_count
         if cycle_hours > MAX_CYCLE_HOURS + 0.0001:
             raise ValueError(

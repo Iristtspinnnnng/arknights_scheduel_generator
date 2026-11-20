@@ -19,8 +19,13 @@ from .production import (
     HIGH_ORDER_SECONDS,
     LOW_ORDER_SECONDS,
     MEDIUM_ORDER_SECONDS,
-    ORUNDUM_PER_SHARD_ORDER,
     ORUNDUM_ORDER_SECONDS,
+    ORUNDUM_ORDER_THROUGHPUT_SCALE,
+    ORUNDUM_REFERENCE_HOURS,
+    ORUNDUM_REFERENCE_LEVEL,
+    ORUNDUM_REFERENCE_OUTPUT,
+    ORUNDUM_REFERENCE_SPEED_PERCENT,
+    ORUNDUM_PER_SHARD_ORDER,
     ProductionSimulator,
     ProductionVector,
     SHARDS_PER_ORUNDUM_ORDER,
@@ -338,15 +343,20 @@ def expected_trading(
         simulator, assignment
     )
     capacity = simulator.trading_order_limit(assignment)
-    orders = min(raw_orders, capacity)
-    vector = ProductionVector(overflowLoss=max(0.0, raw_orders - capacity))
+    # 与生产模拟器同口径：源石订单不看订单上限（校准 v2，见 production.ORUNDUM_REFERENCE_*）。
+    clipped = target != "O_DIAMOND"
+    orders = min(raw_orders, capacity) if clipped else raw_orders
+    vector = ProductionVector(
+        overflowLoss=max(0.0, raw_orders - capacity) if clipped else 0.0
+    )
     vector.fatigueRisk = expected_fatigue(simulator, assignment, duration_hours)
     if target == "O_GOLD":
         vector.lmdGross = orders * profile.expected_lmd
         vector.pureGoldDelta = -orders * profile.expected_gold
     elif target == "O_DIAMOND":
-        vector.orundum = orders * ORUNDUM_PER_SHARD_ORDER
-        vector.shardDelta = -orders * SHARDS_PER_ORUNDUM_ORDER
+        scale = ORUNDUM_ORDER_THROUGHPUT_SCALE
+        vector.orundum = orders * ORUNDUM_PER_SHARD_ORDER * scale
+        vector.shardDelta = -orders * SHARDS_PER_ORUNDUM_ORDER * scale
     return vector
 
 
@@ -484,7 +494,24 @@ def trade_model_summary() -> dict[str, Any]:
             "shards": SHARDS_PER_ORUNDUM_ORDER,
             "orundum": ORUNDUM_PER_SHARD_ORDER,
             "seconds": ORUNDUM_ORDER_SECONDS,
-            "note": "Timing is calibrated to 2 hours/order from the Yituliu 2026-06 243/342 Orundum schedule labels.",
+            "calibrationVersion": 2,
+            "speedSource": "stationed_operator_skills",
+            "orderLimitApplied": False,
+            "throughputScale": round(ORUNDUM_ORDER_THROUGHPUT_SCALE, 6),
+            "reference": {
+                "level": ORUNDUM_REFERENCE_LEVEL,
+                "slots": 3,
+                "speedPercent": ORUNDUM_REFERENCE_SPEED_PERCENT,
+                "hours": ORUNDUM_REFERENCE_HOURS,
+                "orundum": ORUNDUM_REFERENCE_OUTPUT,
+            },
+            "note": (
+                "Timing is calibrated to 2 hours/order from the Yituliu 2026-06 243/342 Orundum "
+                "schedule labels. Version 2 lets operator skills drive order throughput (v1 "
+                "overwrote the speed with a constant 132% for every L3 room), skips the static "
+                "order limit because shard supply is the real constraint, and keeps the absolute "
+                "scale anchored on the reference room above."
+            ),
         },
         "drones": {
             "dailyDrones": DAILY_DRONES,

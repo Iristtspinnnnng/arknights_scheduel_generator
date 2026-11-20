@@ -268,17 +268,45 @@ GUIDE_LMD_TRADE_LOOKUPS = (
     },
 )
 
-GUIDE_ORUNDUM_TRADE_LOOKUPS = (
-    {
-        "id": "orundum_trade_l3_2026_06_static",
-        "level": 3,
-        "paperEfficiencyPercent": 132.0,
-        "source": (
-            "Yituliu 2026-06 Orundum trade room summary: level-3 Orundum Trading Post "
-            "paper efficiencies around 130-135%."
-        ),
-    },
-)
+# ---- O_DIAMOND（源石订单）校准 v2 -------------------------------------------
+#
+# v1 的病灶：``guide_orundum_trade_lookup`` 对**任何** L3 O_DIAMOND 房间都命中，
+# 把速度强行覆盖成 ``paperEfficiencyPercent = 132``（干员技能完全不参与），
+# 于是 4750 个 TRADING/O_DIAMOND 组合全都产出 282.000（标签是常数，读出层只能学到噪声）。
+# 游戏里不是这样：源石订单的**获取效率**由贸易站干员生产力决定，源石碎片的产出由
+# 制造站「源石类配方」的生产力决定，所以搓玉是吃干员技能的。
+#
+# v2 的做法：
+#   1. 速度只来自干员技能（走和其他贸易站同一条 ``room_speed_multiplier`` 路径）；
+#   2. O_DIAMOND **不裁剪订单上限**：真正的约束是源石碎片供给，不是订单银行
+#      （v1 的 282 本身就已经超过 L3 订单上限 10 单所能覆盖的 200，说明样本是按
+#      「随手收单」的吞吐算的；裁剪还会把 +32% 以上的梯度全部压平）；
+#   3. 用**单一常数**把绝对量级锚回 v1 的参照点，历史搓玉数字仍然可比。
+#
+# 参照点（写死在这里，测试 ``test_orundum_reference_room_still_reproduces_the_guide_anchor``
+# 钉住它）：L3 / 3 工位 / 技能 +132% / 无中枢加成 / 12h  ⇒  **282.000** 合成玉。
+ORUNDUM_REFERENCE_LEVEL = 3
+ORUNDUM_REFERENCE_SLOTS = 3
+ORUNDUM_REFERENCE_SPEED_PERCENT = 132.0
+ORUNDUM_REFERENCE_HOURS = 12.0
+ORUNDUM_REFERENCE_OUTPUT = 282.0
+
+
+def orundum_reference_raw_output() -> float:
+    """参照配置下**未缩放**的 12h 合成玉产出（只用本模块常量，便于自检）。
+
+    这里刻意只用常量、不碰 ``GameData``：L3 贸易站的 ``orderSpeed`` 相位增量是 1.0，
+    所以倍率就是 ``1 + 工位基础增益 + 技能速度``。测试里另外用真实模拟器复核一遍。
+    """
+    base_percent = DEFAULT_BASIC_SPEED_BUFF * ORUNDUM_REFERENCE_SLOTS * 100.0
+    multiplier = 1.0 + base_percent / 100.0 + ORUNDUM_REFERENCE_SPEED_PERCENT / 100.0
+    orders = ORUNDUM_REFERENCE_HOURS * 3600.0 / ORUNDUM_ORDER_SECONDS * multiplier
+    return orders * ORUNDUM_PER_SHARD_ORDER
+
+
+# 唯一的校准常数。当前恒等于 1.0（v1 的 guide 分支本来就是这个公式在 +132% 处的求值），
+# 保留成显式常数是为了「以后要动锚点只动一处」，而不是在公式里散落魔法数字。
+ORUNDUM_ORDER_THROUGHPUT_SCALE = ORUNDUM_REFERENCE_OUTPUT / orundum_reference_raw_output()
 
 GUIDE_SPECIAL_TRADE_ANCHORS: dict[str, dict[str, Any]] = {
     "但书": {
@@ -903,7 +931,6 @@ class ProductionSimulator:
     ) -> RoomProduction:
         target = room.target or "O_GOLD"
         guide_lookup = self.guide_lmd_trade_lookup(room) if target == "O_GOLD" else None
-        guide_orundum_lookup = self.guide_orundum_trade_lookup(room) if target == "O_DIAMOND" else None
         if guide_lookup is not None:
             lookup_effective_percent = guide_lookup.get(
                 "scheduleEffectivePercent", guide_lookup["paperEfficiencyPercent"]
@@ -951,52 +978,6 @@ class ProductionSimulator:
                     ),
                 },
                 skillEffectAudit=guide_lookup_skill_effect_audit(room, guide_lookup),
-            )
-        if guide_orundum_lookup is not None:
-            lookup_effect = replace(
-                effect,
-                speed_percent=float(guide_orundum_lookup["paperEfficiencyPercent"])
-                + effect.control_speed_percent,
-            )
-            profile = self.trade_order_profile(target, room.room_level, lookup_effect)
-            multiplier = self.room_speed_multiplier(room, lookup_effect)
-            raw_orders = duration_hours * 3600.0 / profile.expected_seconds * multiplier
-            vector = ProductionVector(
-                orundum=raw_orders * profile.expected_orundum,
-                shardDelta=-raw_orders * profile.expected_shards,
-                fatigueRisk=fatigue_risk(room, duration_hours, lookup_effect, self.stationed_slots(room)),
-            )
-            return RoomProduction(
-                roomId=room.room_id,
-                roomType=room.room_type,
-                target=target,
-                vector=vector,
-                effect=lookup_effect,
-                producedUnits=raw_orders,
-                cappedUnits=raw_orders,
-                capacity=None,
-                baseSpeedPercent=self.base_speed_percent(room),
-                stationSlots=self.stationed_slots(room),
-                roomLevel=room.room_level,
-                collectionIntervalHours=duration_hours,
-                assumptions=[
-                    guide_orundum_lookup["source"],
-                    "Guide-calibrated Orundum order benchmarks use paper efficiency and raw order throughput without static order-limit clipping.",
-                ],
-                tradeOrderProfile={
-                    **generic_trade_profile_to_dict(profile, room),
-                    "calibrationMode": "guide_orundum_exact_lookup",
-                    "source": guide_orundum_lookup["source"],
-                    "lookupId": guide_orundum_lookup["id"],
-                    "paperEfficiencyPercent": guide_orundum_lookup["paperEfficiencyPercent"],
-                    "scheduleEffectivePercent": round(
-                        guide_orundum_lookup["paperEfficiencyPercent"]
-                        + effect.control_speed_percent,
-                        3,
-                    ),
-                    "controlSpeedPercent": round(effect.control_speed_percent, 3),
-                },
-                skillEffectAudit=guide_orundum_lookup_skill_effect_audit(room, guide_orundum_lookup),
             )
         mechanism_estimate = self.special_lmd_trade_estimate(room) if target == "O_GOLD" else None
         if mechanism_estimate is not None:
@@ -1047,9 +1028,14 @@ class ProductionSimulator:
         multiplier = self.room_speed_multiplier(room, effect)
         raw_orders = duration_hours * 3600.0 / profile.expected_seconds * multiplier
         capacity = self.trading_order_limit(room) + effect.order_limit_bonus
-        guide_orundum_order = target == "O_DIAMOND" and self.calibration_profile == "guide"
-        orders = raw_orders if ignore_capacity or guide_orundum_order else min(raw_orders, capacity)
-        overflow = 0.0 if ignore_capacity or guide_orundum_order else max(0.0, raw_orders - capacity)
+        # 源石订单不看订单上限（校准 v2，见 ORUNDUM_REFERENCE_* 上方的说明）：
+        # 真正的约束是源石碎片供给；而且裁剪会把「+32% 以上」的速度差全部压平，
+        # 那正是 v1 在 O_DIAMOND 上零梯度的另一半原因。
+        bounded_by_order_limit = target != "O_DIAMOND"
+        clip = bounded_by_order_limit and not ignore_capacity
+        orders = min(raw_orders, capacity) if clip else raw_orders
+        overflow = max(0.0, raw_orders - capacity) if clip else 0.0
+        scale = ORUNDUM_ORDER_THROUGHPUT_SCALE if target == "O_DIAMOND" else 1.0
         vector = ProductionVector(
             overflowLoss=overflow,
             fatigueRisk=fatigue_risk(room, duration_hours, effect, self.stationed_slots(room)),
@@ -1058,17 +1044,17 @@ class ProductionSimulator:
             vector.lmdGross += orders * (profile.expected_lmd + effect.lmd_per_order_bonus)
             vector.pureGoldDelta -= orders * profile.expected_gold
         elif target == "O_DIAMOND":
-            vector.orundum += orders * profile.expected_orundum
-            vector.shardDelta -= orders * profile.expected_shards
+            vector.orundum += orders * profile.expected_orundum * scale
+            vector.shardDelta -= orders * profile.expected_shards * scale
         return RoomProduction(
             roomId=room.room_id,
             roomType=room.room_type,
             target=target,
             vector=vector,
             effect=effect,
-            producedUnits=raw_orders,
-            cappedUnits=orders,
-            capacity=capacity,
+            producedUnits=raw_orders * scale,
+            cappedUnits=orders * scale,
+            capacity=capacity if bounded_by_order_limit else None,
             baseSpeedPercent=self.base_speed_percent(room),
             stationSlots=self.stationed_slots(room),
             roomLevel=room.room_level,
@@ -1077,13 +1063,29 @@ class ProductionSimulator:
                 profile.source,
                 *(
                     [
-                        "Guide-calibrated Orundum order benchmarks use raw order throughput without static order-limit clipping."
+                        "Orundum order throughput is calibrated v2: speed comes from the stationed operators and the "
+                        f"static order limit is not applied; a single constant ({ORUNDUM_ORDER_THROUGHPUT_SCALE:.6f}) "
+                        f"keeps the reference room (L{ORUNDUM_REFERENCE_LEVEL}, "
+                        f"+{ORUNDUM_REFERENCE_SPEED_PERCENT:g}% speed, "
+                        f"{ORUNDUM_REFERENCE_HOURS:g}h) at {ORUNDUM_REFERENCE_OUTPUT:.3f} Orundum."
                     ]
-                    if guide_orundum_order
+                    if target == "O_DIAMOND"
                     else []
                 ),
             ],
-            tradeOrderProfile=generic_trade_profile_to_dict(profile, room),
+            tradeOrderProfile=(
+                {
+                    **generic_trade_profile_to_dict(profile, room),
+                    "calibrationMode": "orundum_throughput_v2",
+                    "throughputScale": round(scale, 6),
+                    "orderLimitApplied": bounded_by_order_limit,
+                    "referenceSpeedPercent": ORUNDUM_REFERENCE_SPEED_PERCENT,
+                    "referenceOutputPerReferenceHours": ORUNDUM_REFERENCE_OUTPUT,
+                    "referenceHours": ORUNDUM_REFERENCE_HOURS,
+                }
+                if target == "O_DIAMOND"
+                else generic_trade_profile_to_dict(profile, room)
+            ),
             skillEffectAudit=special_trade_fallback_skill_effect_audit(room),
         )
 
@@ -1155,18 +1157,6 @@ class ProductionSimulator:
             if not lookup_partner_requirements_met(lookup, room.operators):
                 continue
             return lookup
-        return None
-
-    def guide_orundum_trade_lookup(self, room: RoomAssignment) -> dict[str, Any] | None:
-        if self.calibration_profile != "guide":
-            return None
-        if self.game_data.data_version == "test":
-            return None
-        if room.target != "O_DIAMOND":
-            return None
-        for lookup in GUIDE_ORUNDUM_TRADE_LOOKUPS:
-            if room.room_level == lookup["level"]:
-                return lookup
         return None
 
     def guide_manufacture_lookup(
@@ -1851,28 +1841,6 @@ def guide_lookup_skill_effect_audit(
         item["lookupId"] = lookup["id"]
         audit.append(item)
     return audit
-
-
-def guide_orundum_lookup_skill_effect_audit(
-    room: RoomAssignment,
-    lookup: dict[str, Any],
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "operator": skill.operator_name,
-            "buffId": skill.buff_id,
-            "buffName": skill.buff_name,
-            "status": "source_calibrated",
-            "scope": "orundum_trade_room_lookup",
-            "calibrationMode": "guide_orundum_exact_lookup",
-            "lookupId": lookup["id"],
-            "reason": (
-                "Yituliu guide room summary calibrates Orundum Trading Post paper efficiency; "
-                "static guide images do not expose an exact operator roster for this room."
-            ),
-        }
-        for skill in room.operators
-    ]
 
 
 def guide_manufacture_lookup_skill_effect_audit(

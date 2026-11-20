@@ -33,6 +33,7 @@ from arknights_schedule_generator.optimizer import (
     normalize_forced_targets,
     parse_layout,
     room_output_score,
+    shift_label,
     target_selection_score,
 )
 from arknights_schedule_generator.production import ProductionReport, ProductionSimulator, ProductionVector
@@ -1576,7 +1577,121 @@ class OptimizerTest(unittest.TestCase):
             group,
         )
 
-        self.assertIsNone(candidate)
+        # 分组落在**低等级**龙门币贸易站（guide 锚点在高等级房间里边际更低）。
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertTrue(room_contains(candidate[1].rooms[1], "TRADING", "O_GOLD", "可露希尔"))
+        self.assertFalse(room_contains(candidate[1].rooms[0], "TRADING", "O_GOLD", "可露希尔"))
+        # 被腾空的源石订单房间必须补人。v1 的零梯度把空房间也算成 282 分，
+        # 于是补位永远被判成「更差」而拒绝——这条断言防的是那个退化回来。
+        self.assertTrue(candidate[0].rooms[0].operators)
+        self.assertTrue(optimizer._active_boundaries_are_valid(candidate))
+
+    # ---- 错峰展开前的「换掉 +消耗 干员」修复（O_DIAMOND 校准 v2 期间发现） ----
+
+    def _rotation_optimizer(self, shift_count: int = 2) -> ScheduleOptimizer:
+        hot = optimizer_skill(
+            "HotMeeting",
+            "MEETING",
+            "meet_hot",
+            45,
+            description="进驻会客室时，线索搜集速度+45%，心情每小时消耗+2",
+        )
+        calm = [
+            optimizer_skill(f"Calm{index}", "MEETING", f"meet_calm_{index}", 40)
+            for index in range(6)
+        ]
+        # 相邻班次不能重复用人，所以每个班次准备一套不同名字的控制中枢/贸易站干员。
+        shift_skills = [
+            optimizer_skill(f"Control{shift}{index}", "CONTROL", f"ctl_{shift}_{index}", 0)
+            for shift in range(shift_count)
+            for index in range(5)
+        ] + [
+            optimizer_skill(f"Trade{shift}{index}", "TRADING", f"trade_{shift}_{index}", 30)
+            for shift in range(shift_count)
+            for index in range(3)
+        ]
+        optimizer = optimizer_with_skills([hot, *calm, *shift_skills])
+        # 只有一间宿舍（5 床）：10 个席位里只要有一个房间是 fast-rotation，
+        # 错峰容量就被压到 3，组数从 2 跳到 3（等价于实测里的 48h → 72h）。
+        optimizer._dorm_specs = lambda layout: [
+            RoomSpec("dormitory_1", "DORMITORY", None, 5, 5, 5)
+        ]
+        return optimizer
+
+    def _rotation_shifts(self, hot_meeting: bool, shift_count: int = 2) -> list[ShiftPlan]:
+        optimizer = self._rotation_optimizer(shift_count)
+        by_name = optimizer.skills_by_operator
+        meeting = (
+            [by_name["HotMeeting"][0], by_name["Calm0"][0]]
+            if hot_meeting
+            else [by_name["Calm0"][0], by_name["Calm1"][0]]
+        )
+        shifts: list[ShiftPlan] = []
+        for shift in range(shift_count):
+            rooms = [
+                make_test_room(
+                    "control_1",
+                    "CONTROL",
+                    None,
+                    [by_name[f"Control{shift}{index}"][0] for index in range(5)],
+                    room_level=5,
+                    slots=5,
+                ),
+                make_test_room(
+                    "trading_1",
+                    "TRADING",
+                    "O_GOLD",
+                    [by_name[f"Trade{shift}{index}"][0] for index in range(3)],
+                ),
+                make_test_room(
+                    "meeting_1",
+                    "MEETING",
+                    None,
+                    [replace(skill) for skill in meeting],
+                    slots=2,
+                ),
+            ]
+            shifts.append(ShiftPlan(shift_label(shift), "08:00", 12, rooms, []))
+        return shifts
+
+    def test_rotation_plan_counts_fast_rotation_rooms_against_dorm_capacity(self) -> None:
+        optimizer = self._rotation_optimizer()
+        layout = parse_layout("243")
+
+        with_hot = optimizer._morale_rotation_plan(layout, self._rotation_shifts(hot_meeting=True))
+        self.assertEqual(with_hot["fastRotationRooms"], {"meeting_1"})
+        self.assertEqual(with_hot["fastRotationWeight"], 2)
+        self.assertEqual(with_hot["staggerCapacity"], 3)
+        self.assertEqual(with_hot["groupCount"], 3)
+
+        without_hot = optimizer._morale_rotation_plan(
+            layout, self._rotation_shifts(hot_meeting=False)
+        )
+        self.assertEqual(without_hot["fastRotationRooms"], set())
+        self.assertEqual(without_hot["groupCount"], 2)
+
+    def test_rotation_repair_replaces_fatiguing_operator_to_shorten_the_cycle(self) -> None:
+        optimizer = self._rotation_optimizer()
+        layout = parse_layout("243")
+        shifts = self._rotation_shifts(hot_meeting=True)
+
+        repaired = optimizer._relieve_morale_rotation_pressure(layout, shifts)
+
+        self.assertIsNot(repaired, shifts)
+        plan = optimizer._morale_rotation_plan(layout, repaired)
+        self.assertEqual(plan["groupCount"], 2)
+        meeting = repaired[0].rooms[2]
+        self.assertEqual(len(meeting.operators), 2, "换人不能把房间改空")
+        self.assertFalse(room_contains(meeting, "MEETING", None, "HotMeeting"))
+        self.assertTrue(optimizer._active_boundaries_are_valid(repaired))
+
+    def test_rotation_repair_leaves_short_cycles_untouched(self) -> None:
+        optimizer = self._rotation_optimizer()
+        layout = parse_layout("243")
+        shifts = self._rotation_shifts(hot_meeting=False)
+
+        self.assertIs(optimizer._relieve_morale_rotation_pressure(layout, shifts), shifts)
 
     def test_room_grouped_insertion_can_force_distinct_lmd_trade_rooms(self) -> None:
         tequila = optimizer_skill("龙舌兰", "TRADING", "tequila_special_order", 30)

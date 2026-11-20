@@ -695,8 +695,20 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
             seen_names.add(name)
             names.append(name)
         if not names:
+            # 变体表里一个人都没有：短名单没有信息优势，交给调用方的逐人贪心兜底
+            # （``_assign_room`` 会按 ``_candidates`` 把房间填满）。
             self._graph_room_combos_cache[cache_key] = ()
             return []
+        if len(names) < spec.capacity:
+            # 技能变体表（``_variant_options``）是按**无排除**的候选池建的，所以排除一批
+            # 干员之后，剩下的池子里可能有人的变体根本不在那张表里。这时短名单会把
+            # 整间房填成 1~2 人——v1 的 O_DIAMOND 常数标签把这个缺陷完全掩盖了
+            # （空房间也满产），v2 之后它直接掉分（333 平衡搓玉 3×8 实测 −144）。
+            # 宁可退回全量枚举，也不要把房间填残。
+            exhausted = super()._room_combos(spec, excluded, duration_hours)
+            self._graph_room_combos_cache[cache_key] = tuple(exhausted)
+            self._record_runtime_count("graphRoomCombos.exhaustiveFallback")
+            return exhausted
 
         # 池内下标：父类同分时的先后顺序就是它。
         rank_of_name: dict[str, int] = {}

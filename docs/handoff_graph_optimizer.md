@@ -3,21 +3,23 @@
 > 写于上下文耗尽前。下一个窗口从这里开始，不必回读聊天记录。
 > 最后更新：第 1、2、4 步 + 单体宿舍恢复 + 菲亚梅塔（自律节点 + 患难之交重置）+ 252/342 基准
 > + **M1（宿舍做成一等分配目标）都已完成**；不搓玉差距已定位到「逐房吃人」。
-> **下一个窗口从 §3 第 7 步（修 O_DIAMOND 校准）开始**，那是 M3（房间节点）的先决条件；
-> 然后是 §3 第 6 步的 M3a（短名单 top-K 精确重排），第 5 步（办公室选人）、第 3 步（轮转表）可顺手做。
+> **第 7 步（修 O_DIAMOND 校准）也已完成**，并顺带修了两个被它暴露出来的结构性缺陷
+> （错峰周期阶跃成本、短名单填不满房间）。下一个窗口从 **§3 第 6 步的 M3a**
+> （短名单 top-K 精确重排）开始；之后是 M3b/c、第 5 步（办公室选人）、第 3 步（轮转表）。
 
 ---
 
 ## 0. 一分钟速览
 
-- 分支 `main`，**领先 `origin/main` 10 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
+- 分支 `main`，**领先 `origin/main` 12 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
   `c2d39ba`（社区打分权重 + 显式羁绊 + numpy + 缓存 + 多起手）、
   `d78daad`（心情审计改成收支记账 + 老的基准容错/循环上限）、
   `9e1b605`（宿舍绿字 + 作用域减耗 + 控制中枢 + 父类纯赤金 7 天上限），
   三个「单体宿舍恢复的锁定语义」「菲亚梅塔＝自给自足特殊节点」「252/342 基准记录」，
-  `1e8651e`（M1：宿舍一等分配），以及最新的 `8b341c4`（患难之交＝手动心情重置 +
-  记录 O_DIAMOND 零梯度的真实原因）。
-- **§3 第 1、2、4 步已完成**：
+  `1e8651e`（M1：宿舍一等分配）、`8b341c4`（患难之交＝手动心情重置 + 记录 O_DIAMOND
+  零梯度的真实原因）、`4915c31`（第 7 步的交接与实测锚点），
+  以及最新的 O_DIAMOND 校准 v2（第 7 步本体 + 两个结构性修复，见 §7）。
+- **§3 第 1、2、4、7 步已完成**：
   - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 3 → 现在是 `version: 4`）；
   - 宿舍补上绿字（`0.0004 × 氛围`）、在岗减耗按作用域解析、控制中枢 −0.05/h × 在岗人数；
   - 单体宿舍恢复（`dorm_rec_single`，26 条）按「锁定最低心情舍友直到回满」的语义启用；
@@ -26,20 +28,33 @@
   - **252/342 现在全部可行**（16/16 组合通过，最差收支 +4.0）；
   - **宿舍是一等分配目标（M1）**：整条排班一次 beam（两套目标）+ 旧贪心三候选，
     用心情审计自己的账本 `(门槛, 最差收支, 总恢复)` 择优。产能分一格没动，
-    总恢复在 7/16 组合上变好，最差收支一格没变差。
+    总恢复在 7/16 组合上变好，最差收支一格没变差；
+  - **O_DIAMOND 校准 v2（第 7 步）**：源石订单速度只来自干员、不裁剪订单上限、单一常数把
+    量级锚在「L3 / 3 工位 / +132% / 12h ⇒ 282.000」。同一批 4750 个组合从**全部 282.000**
+    铺开到 **123.6 ~ 339.6**，读出层 holdout **R² −110.6 → 0.753**、Spearman 0.30 → 0.94。
   细节见 §2、§3、§4。
-- **不搓玉差距（§3 第 6 步的诊断，已完成）**：−21.06 分里 −20.4 在生产房间的精确分
+- **第 7 步顺带修掉的两个结构性缺陷**（都是被「有真梯度」暴露出来的，详见 §3 第 7 步后半）：
+  1. **错峰展开的周期是阶跃成本**：会客室里一个「心情每小时消耗 +2」的干员能把错峰容量
+     从 12 压到 7、把 48h 周期逼成 72h（日均分 ÷3）。新增
+     `_relieve_morale_rotation_pressure`：展开前把带 +消耗 的干员换出房间，
+     **只在确实减少组数时**保留改动。
+  2. **短名单填不满房间**：技能变体表按「无排除」池建立，排除一批干员后短名单可能只剩
+     1~2 人，房间被填成 2/3；v1 的常数标签把这个缺陷完全掩盖（空房间也满产）。
+     现在 `0 < len(names) < capacity` 时退回父类全量枚举（`names` 为空时仍返回空短名单，
+     交给调用方的逐人贪心填满 —— 实测那一支在 342 不搓玉上更好）。
+- **不搓玉差距（§3 第 6 步的诊断）**：−21.06 分里 −20.4 在生产房间的精确分
   （贸易 −17.3、制造 −8.0 + 若干正项），会客室 0、办公室折算 0.77；机制是**短名单覆盖没问题、
   但 beam 按预测分逐房吃人**（342 不搓玉的 `trading_2` 选到自己短名单**第 56 名**）。
+  **校准 v2 之后「不搓玉稳输」不再成立**：342 不搓玉 −3.09% → **+0.17%**（§5）。
 - 安全备份分支：`backup/pre-rebase-graph`（rebase 前的原始状态）。
-- 测试：**270 passed / 1 skipped / 1 failed**（新增 `DormitoryFirstClassAssignmentTest` 11 个、
-  `HardshipSwapTest` 5 个）。唯一失败是既有环境问题
+- 测试：**276 passed / 1 skipped / 1 failed**（新增 O_DIAMOND 3 个、错峰修复 4 个、
+  短名单兜底 1 个；删掉旧的 guide 查表用例 1 个）。唯一失败是既有环境问题
   （`test_calibration_report_examples_pass` 需要仓库外的 `C:\tmp\yituliu_schedule_images_current.js`，
   报 `missing_local_asset`），与本项目改动无关，不要去"修"它。
 - 环境：系统 `python`（WindowsApps，3.13）**没有 pytest**，不能直接跑测试；本轮实际用的是 DSH 自带的
   Python 3.12.14（pytest 9.2.0 / openpyxl 3.1.5）：
   `C:\Users\15455\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe -m pytest tests -q`
-  整套约 73 秒（并发跑基准时会到 95 秒）。`AGENT.md` 里写的 conda 环境在本机不存在。
+  整套约 64 秒。`AGENT.md` 里写的 conda 环境在本机不存在。
   numpy 2.3.5 可用，但**不要**把 numpy 加进 `pyproject.toml`（用户明确要求）。
 
 ---
@@ -197,30 +212,34 @@ source_index = ((plan_index + group_count - 1 - group_index) // group_count) % l
 把计划数乘成 `base × group_count`，时刻仍沿用同一套网格。没有「某个干员提前 2 小时下班」这种
 个体化换班。若以后要做（Mower 那种逐人换班），需要给 `ShiftPlan` 增加「每人区间」而不是一个 clock。
 
-### 2.7 校准缺陷：O_DIAMOND 贸易站对干员**免疫**（搓玉零梯度的真正原因）
+### 2.7 校准缺陷：O_DIAMOND 贸易站对干员**免疫**（搓玉零梯度的真正原因）——**已修（校准 v2）**
+
+> 现状（v2，已完成）：源石订单的速度**只来自干员技能**，**不裁剪订单上限**，量级由
+> `production.ORUNDUM_ORDER_THROUGHPUT_SCALE`（当前 1.0，由参照点反解）锚在
+> 「L3 / 3 工位 / +132% / 12h ⇒ 282.000」。4750 个组合现在是 **123.6 ~ 339.6**，
+> 读出层 holdout R² **−110.6 → 0.753**。下面保留 v1 的病历与修法，作为「为什么这么改」的背景。
 
 之前把它写成「合成玉贸易站是零梯度房间（guide 刊例固定 132%）」——那是**现象**，不是原因。
 真正的原因是 `production.py::guide_orundum_trade_lookup`：它对**任何** L3 `O_DIAMOND` 房间都命中
-（只检查 `target` 与 `room_level`），然后把速度**强行覆盖**成 `paperEfficiencyPercent = 132`
-（`production.py:955-969`），干员技能完全不参与。于是：
+（只检查 `target` 与 `room_level`），然后把速度**强行覆盖**成 `paperEfficiencyPercent = 132`，
+干员技能完全不参与。于是：
 
 | 口径 | 4750 个 `TRADING/O_DIAMOND` 组合的 orundum |
 | --- | --- |
-| `calibration_profile="guide"`（默认） | **全部 282.000**（1 种取值） |
-| 不走 guide 查表（`raw`） | 200 ~ 220（有梯度） |
+| v1（`calibration_profile="guide"`，默认） | **全部 282.000**（1 种取值） |
+| v1 的 `raw`（不查表，但被订单上限裁剪） | 200 ~ 220（有梯度，但 +32% 以上被压平） |
+| **v2（现状，guide 与 raw 同一条路）** | **123.6 ~ 339.6**（skill 和 0% ~ 180%） |
 
-这就是读出层对 O_DIAMOND 的 holdout R² = −110 的来源：**标签本身是常数**。
-但游戏里不是这样——`源石订单`（2 源石碎片 → 20 合成玉、2 小时/单）的**获取效率**由贸易站干员
-生产力决定，`源石碎片` 的产出由制造站「源石类配方」的生产力决定。所以搓玉**是**吃干员技能的，
-现在这套模型把其中一半（贸易侧）抹平了。复现脚本：`tools/probe_shard_and_hardship.py`。
+v1 的 R² = −110 就是「标签本身是常数」造成的。游戏里不是这样——`源石订单`
+（2 源石碎片 → 20 合成玉、2 小时/单）的**获取效率**由贸易站干员生产力决定，
+`源石碎片` 的产出由制造站「源石类配方」的生产力决定。所以搓玉**是**吃干员技能的。
+复现脚本：`tools/probe_shard_and_hardship.py`、`tools/measure_orundum_anchor.py`。
 
-修法（**校准改动，必须先定口径再动**）：
-1. 保留 132% 这个锚点当「参照三人的纸面效率」，但让**实际速度**参与订单吞吐
-   （即走 `trade_order_profile` + `room_speed_multiplier` 的同一条路，而不是覆盖 speed）；
-2. 用参照组合反解 `ORUNDUM_ORDER_SECONDS`/每单期望，使参照组合仍能复现 282/天，
-   这样历史搓玉数字的可比性只用**一个常数**维持；
-3. 改完必须重跑：`tests/test_production.py` 的校准用例、4 场景基准、16 组扫描，
-   并把 §5 的两张表重记（搓玉分数会变），同时确认混合算法也按新口径打分（两边同口径才可比）。
+v2 的做法（与当初的修法计划一致）：
+1. 保留 132% 这个锚点当「参照纸面效率」，但**实际速度**由干员技能给出（走
+   `trade_order_profile` + `room_speed_multiplier` 的同一条路，不再覆盖 speed）；
+2. **不裁剪订单上限**（源石碎片供给才是真约束；裁剪会把 +32% 以上的梯度压平）；
+3. 用**单一常数**把量级锚回 282/12h（见 `ORUNDUM_REFERENCE_*`），历史可比性只靠这一个数。
 
 ---
 
@@ -485,64 +504,94 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 （几分钟）；`docs/graph_optimizer.md` §6 记的「短名单顺序敏感（±3%）」和「样本越多越差」
 两条都要在这个新形态下重测，不能直接沿用旧结论。
 
-### 第 7 步：修 O_DIAMOND 校准（**下个窗口从这里开始**）
+### 第 7 步：修 O_DIAMOND 校准 —— **已完成（校准 v2）**
 
-**为什么先做这一步。** 现在模型里三级源石订单贸易站对干员**完全免疫**（§2.7），
-搓玉有三分之一的房间是常数，读出层在那间房只能学到噪声（holdout R² = −110）。
-不修它，第 6 步的房间节点在搓玉侧没有梯度，M3 的效果会被这半边直接吃掉。
-用户已经确认这**不是游戏事实**：源石订单吞吐吃贸易站干员生产力、源石碎片产出吃制造站
-「源石类配方」生产力。
+**为什么先做这一步。** v1 里三级源石订单贸易站对干员**完全免疫**（§2.7），搓玉有三分之一的
+房间是常数，读出层在那间房只能学到噪声（holdout R² = −110）。不修它，第 6 步的房间节点在
+搓玉侧没有梯度。
 
-**病灶**：`production.py::guide_orundum_trade_lookup`（:1160）只匹配 `target` + `room_level`，
-命中后 `_simulate_trade_room`（:955-969）把 `speed_percent` **覆盖**成
-`paperEfficiencyPercent = 132`，并用未裁剪的 `raw_orders`（:1050-1052 里
-`guide_orundum_order` 跳过订单上限）。所以任何 L3 `O_DIAMOND` 房间、任何干员组合，
-12h 都恰好产出 **282.000** orundum。
+**病灶（v1）**：`production.py::guide_orundum_trade_lookup` 只匹配 `target` + `room_level`，
+命中后把 `speed_percent` **覆盖**成 `paperEfficiencyPercent = 132`，并跳过订单上限。
+所以任何 L3 `O_DIAMOND` 房间、任何干员组合，12h 都恰好产出 **282.000**。
 
-**已测好的锚点**（`outputs/orundum_anchor.md`，脚本 `tools/measure_orundum_anchor.py`）：
+**实际做法**（`production.py`）：
 
-| 口径 | 12h 产出 | 说明 |
+1. 删除 `GUIDE_ORUNDUM_TRADE_LOOKUPS` / `guide_orundum_trade_lookup` /
+   `guide_orundum_lookup_skill_effect_audit`，O_DIAMOND 改走和龙门币订单同一条
+   `trade_order_profile` + `room_speed_multiplier` 路径，`speed_percent` **只来自干员**。
+2. **O_DIAMOND 不裁剪订单上限**（`bounded_by_order_limit = target != "O_DIAMOND"`）：
+   真正的约束是源石碎片供给；而且裁剪会把 +32% 以上的速度差全部压平（v1 的表里
+   +32%×3 / +60% / +100% 全是 200.0，就是证据）。
+3. 单一校准常数：`ORUNDUM_ORDER_THROUGHPUT_SCALE = ORUNDUM_REFERENCE_OUTPUT /
+   orundum_reference_raw_output()`，当前 **1.0**。参照点写死成常量
+   （`ORUNDUM_REFERENCE_LEVEL/SLOTS/SPEED_PERCENT/HOURS/OUTPUT`），
+   所以「L3 / 3 工位 / +132% / 12h ⇒ 282.000」是**由构造保证**的，测试钉住它。
+   **注意**：交接文档上一版写的 `r ≈ 1.728` 是**算错了**——那个数假设参照速度是 +32%。
+   以 +132% 为参照时，v1 的 guide 分支本来就是这个公式在 132% 处的求值，所以常数必须是 1.0。
+   量级没有移动，移动的只是「速度从哪来」和「裁不裁剪」。
+4. `tradeOrderProfile` 审计字段换成 `calibrationMode: "orundum_throughput_v2"` +
+   `throughputScale` / `orderLimitApplied: false` / 参照点；`calibration.trade_model_summary()`
+   的 `orundumOrder` 加了 `calibrationVersion: 2` 与同样的参照点。
+5. `calibration.expected_trading` 同步（O_DIAMOND 也不裁剪），否则原子用例会和新模拟器对不上。
+6. **缓存作废**：`graph_cache.CACHE_SCHEMA_VERSION` 2 → 3（读出层是按旧标签拟合的）、
+   `optimizer.OPTIMIZER_MODEL_VERSION` 22 → 23（candidate 缓存里存着旧分数）。
+   改完第一次跑基准会重新拟合（几分钟），之后照常复用。
+
+**实测**（`outputs/orundum_anchor.md`，脚本 `tools/measure_orundum_anchor.py`）：
+
+| 指标 | v1 | v2 |
 | --- | --- | --- |
-| guide（速度被覆盖成 132%） | **282.000** | 现状，所有组合相同 |
-| raw，速度 +0% | 123.600 | 线性段 |
-| raw，速度 +32%（单人） | 162.000 | = 123.6 × 1.32，线性 |
-| raw，速度 +32%×3 | 200.000 | **被订单上限裁剪**（见下） |
-| raw，速度 +60% / +100% | 195.6 / 200.0 | 均被上限压平 |
+| 4750 个组合的 12h orundum | 全部 282.000 | **123.6 ~ 339.6** |
+| 组合速度（skill 和） | 不参与 | min 0 / p50 65 / p90 100 / max 180 |
+| 精确分区间 | 277.2 ~ 282.0 | 123.6 ~ 339.6（相对梯度 174.8%） |
+| O_DIAMOND holdout R² | **−110.6** | **0.753**（Spearman 0.30 → 0.94） |
+| guide vs raw | 两条不同的路 | **同一条路**（O_DIAMOND 不再有 profile 差异） |
 
-**做法（建议）**：
-1. 让 O_DIAMOND 走和其他贸易站同一条路：`trade_order_profile` + `room_speed_multiplier`，
-   `speed_percent` 来自干员（不再覆盖）。
-2. **保留「O_DIAMOND 不裁剪订单上限」**（`guide_orundum_order` 那个分支），
-   理由是源石碎片供给才是真约束、订单银行不是；否则 +32%×3 就已经到 200 的天花板、
-   梯度又没了（表里那一行就是证据）。
-3. 乘一个**单一常数**把绝对量级锚回原状：参照速度 132% 时仍是 282/12h。
-   按上表，raw 的裸值在 132% 时约 163.2（=123.6×1.32），所以 **r ≈ 282/163.2 ≈ 1.728**。
-   这个 r 就是唯一新增的校准常数，要写进 `assumptions` 和文档，并在测试里钉住
-   「参照速度 132% ⇒ 282.000」。
-4. 参照速度的定义（「132% 纸面效率、无中枢加成、L3、12h」）写死成常量+测试，
-   以后改锚点必须同时改测试与 §5 表。
+**新增测试**（`tests/test_production.py`）：
+- `test_orundum_trade_throughput_has_an_operator_gradient`（最强 vs 最弱 > 5%，单调递增）；
+- `test_orundum_reference_room_still_reproduces_the_guide_anchor`（参照 282.000、常数 1.0、
+  guide/raw 同值、审计字段）；
+- `test_orundum_trade_does_not_clip_the_static_order_limit`（12h +200% ⇒ 363.6、无溢出；
+  龙门币订单仍被裁剪）。
+旧用例 `test_yituliu_orundum_trade_lookup_uses_static_guide_efficiency` 已删除（它锁的就是旧口径）。
 
-**会踩到的点**：
-- `guides` 里那条 `GUIDE_ORUNDUM_TRADE_LOOKUPS` 只剩「锚点」语义，不要再按 level 无条件命中；
-  要么删掉查表、要么把它降级成 `reference 132%` 的常量。
-- `tests/test_production.py` 里断言 orundum/校准用例的期望值会变（搜 `orundum`、`282`、
-  `O_DIAMOND`），要按新口径重写期望，**不要**为了过测试把 r 调回去。
-- `calibration.py` 的 `atomic_case("trade_orundum_l3_12h", ...)`、`modeled[...]` 那几条
-  也会一起变（`calibration.py:2064-2110`）。
-- 基准会动：搓玉场景（243/252/342 balanced、333 max）的 orundum 与总分都会变。
-  **必须重记 §5 两张表**，并在表头写明「O_DIAMOND 校准 v2」；混合与图卷积同口径，比较仍公平。
-- 不要顺手改 `SHARDS_PER_ORUNDUM_ORDER` / `ORUNDUM_PER_SHARD_ORDER`（2 碎片 → 20 玉是硬事实），
-  只调「吞吐 × 常数」。
+#### 第 7 步暴露出来的两个结构性缺陷（同一次提交里修掉）
 
-**验收**：
-1. `pytest tests -q` 全绿（除既有的 `missing_local_asset`），新增 2-3 个测试：
-   - 同一批 O_DIAMOND 组合现在**有梯度**（最强 vs 最弱相差 > 5%）；
-   - 参照组合仍复现 282/12h（把 r 与参照写死）；
-   - 干员技能 +速度时 orundum 单调上升（不再被上限压平）。
-2. 4 场景 + 252/342 基准重跑，把 §5 两张表换成新数字，并在文档里说明「本次数字变化来自校准，
-   不是算法改进」。
-3. 16 组可行性扫描仍全过、最差收支 ≥ +4.0。
-4. 图卷积在 O_DIAMOND 上的 holdout R² 从 −110 变成有意义的正数（`graph_benchmark` 的模型表）。
+1. **错峰展开的周期长度是阶跃成本 —— `_relieve_morale_rotation_pressure`（`optimizer.py`）**
+   错峰展开把 `fastRotationRooms`（有干员带「心情每小时消耗 +N」的房间）的席位**整块**
+   从错峰容量里扣掉。实测 333 平衡搓玉 3×8：图卷积的初始排班把见行者（+2.0/h）放进会客室，
+   `staggerCapacity` 从 12 掉到 7，`groupCount` 3 而不是 2 —— 周期 72h，日均分 ÷3，
+   分数 434.5 vs 混合 514.6。
+   修法：展开前先试「把 +消耗 干员换成本房间次优的非消耗干员」，**只在 `groupCount` 真的变小
+   时**保留；换不满一屋人就放弃；换完整体重过 `_active_boundaries_are_valid`（相邻班次不重复）。
+   把 `_morale_rotation_plan` 抽成展开与修复共用的唯一估计入口（`roomWeights` / `fastRotationRooms`
+   / `staggerCapacity` / `groupCount`），避免两处各算一套。
+   效果：333 平衡搓玉 3×8 434.5 → **492.6**（−15.57% → −4.28%）；243 不搓玉 3×8 的周期
+   也从 72h 回到 48h（分数 563.5 → 561.8，最差收支 14.0 → **20.0**）。
+   测试：`test_optimizer.py::OptimizerTest::test_rotation_*`（4 个：公式、修复生效、
+   不填残房间、短周期不动）。
+2. **短名单填不满房间 —— `graph_optimizer._room_combos` 的全量枚举兜底**
+   技能变体表（`_variant_options`）是按**无排除**候选池建立的；排除一批干员之后，剩下的
+   池子里可能有人的变体根本不在那张表里。极端情况下短名单只剩 1~2 个人，
+   `rank_combinations(capacity=min(capacity, len(names)))` 就把房间填成 2/3。
+   v1 的常数标签把这个缺陷完全掩盖（空房间也满产），v2 之后它直接掉分
+   （333 平衡搓玉 3×8 里两个 82.4 的房间各被复制两次，合计 −144）。
+   修法：`0 < len(names) < spec.capacity` 时退回父类全量枚举（结果进同一张缓存）；
+   `names` 为空时仍返回空短名单（让调用方的逐人贪心把房间填满 —— 实测这一支在
+   342 不搓玉上更好：681.9 vs 659.7）。
+   效果：333 平衡搓玉 3×8 492.6，且 `generate` 的「只填入 N/M 名干员」告警消失。
+   测试：`test_graph_optimizer.py::RealDataGraphTest::
+   test_real_shortlist_still_fills_a_room_after_the_top_pool_is_excluded`。
+
+#### 验收（全部达成）
+
+1. `pytest tests -q`：**276 passed / 1 skipped / 1 既有环境失败**（`missing_local_asset`）。
+2. 16 组扫描：**16/16 通过，最差收支 +4.0**（与第 7 步之前同一个数）；
+   `normal` 分数不变（605.6 / 563.5→561.8 / 646.6 / 599.7 / 680.8 / 632.4 / 696.3 / 641.5），
+   `balanced-orundum` 分数按新口径上移（§4c）。
+3. 4 场景基准：0 胜 3 负 1 平，平均分数比 **0.988**；252/342 基准：2 胜 1 负 1 平，
+   **1.0016**。两套数字都是「混合与图卷积同口径」，可比。
+4. O_DIAMOND holdout R² −110.6 → **0.753**。
 
 **之后**：回到 §3 第 6 步的 M3a（短名单 top-K 精确重排），再做 M3b/c。
 
@@ -564,19 +613,28 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 outputs/normal_gap_summary.md      四个场景的分数构成差异
 outputs/normal_gap_342.md          342 不搓玉：四个班次族逐房间差异
 outputs/base_decode_342.md         342 不搓玉：基础解码层差异 + 短名单名次
-outputs/shard_probe.md             O_DIAMOND 是否吃干员（guide 全 282 / raw 200~220）
-outputs/orundum_anchor.md          第 7 步的锚点：0/32/60/100% 速度对应的 12h 产出与缩放比 r
+outputs/shard_probe.md             O_DIAMOND 是否吃干员（v1 的 guide 全 282 / raw 200~220）
+outputs/orundum_anchor.md          校准 v2 的锚点 + 速度→产出表 + 真实 4750 组合的分布
 outputs/hardship_impact.md         四个基准场景是否触发患难之交（否）
+outputs/scan_orundum_v2.json       第 7 步之后的 16 组扫描明细
+outputs/benchmark_orundumv2/       4 场景基准（校准 v2）
+outputs/benchmark_252_342_orundumv2/  252/342 基准（校准 v2）
 ```
 
 ```powershell
-python tools/scan_m1_dormitory.py --output outputs/scan_m1_dormitory.json
+python tools/scan_m1_dormitory.py --output outputs/scan_orundum_v2.json
 # 只跑紧凑的 2×12： --layouts 252,342 --shift-patterns 2x12
+
+# 校准 v2 的锚点与梯度（改 O_DIAMOND 口径必跑）
+python tools/measure_orundum_anchor.py
 ```
 
 同目录还有：`tools/time_one_case.py`（单场景墙钟）、`tools/inspect_one_case.py`（审计摘要 +
 宿舍分配）、`tools/inspect_worst_balance.py`（最差收支的干员与其休息/在岗班次）、
-`tools/check_generate_outputs.py`（检查 `generate` 导出的 `cycleHours` / 门槛）。
+`tools/check_generate_outputs.py`（检查 `generate` 导出的 `cycleHours` / 门槛）、
+`tools/measure_orundum_anchor.py`（O_DIAMOND 锚点 + 梯度 + 组合分布）。
+调试用的临时脚本本轮都删了（`debug_boundary_relocation.py` / `debug_underfilled_room.py` /
+`probe_orundum_speeds.py`），需要时按 §3 第 7 步的描述重建。
 
 ---
 
@@ -633,7 +691,88 @@ python tools/scan_m1_dormitory.py --output outputs/scan_m1_dormitory.json
 
 ---
 
-## 5. 基准现状（rebase 后，1 胜 3 负，均比 0.981）
+### §4c 第 7 步（O_DIAMOND 校准 v2）之后的 16 组扫描
+
+`tools/scan_m1_dormitory.py`（同一脚本，同一默认 16 组；明细 `outputs/scan_orundum_v2.json`）：
+
+| 组合 | 分数（校准 v1 → v2） | 周期h（前→后） | 最差收支（前→后） |
+| --- | --- | --- | --- |
+| 243 普通 2×12 | 605.6 → 605.6 | 48 → 48 | 30.0 → 30.0 |
+| 243 普通 3×8 | 563.5 → **561.8** | **72 → 48** | 14.0 → **20.0** |
+| 243 平衡 2×12 | 380.3 → **402.5** | 48 → 48 | 30.0 → 31.2 |
+| 243 平衡 3×8 | 354.9 → **385.2** | 72 → 48 | 20.0 → 20.0 |
+| 252 普通 2×12 | 646.6 → 646.6 | 48 → 48 | 7.2 → 7.2 |
+| 252 普通 3×8 | 599.7 → 599.7 | 48 → 48 | 4.0 → 4.0 |
+| 252 平衡 2×12 | 359.9 → **435.2** | 48 → 48 | 7.2 → 7.2 |
+| 252 平衡 3×8 | 333.1 → **365.5** | 48 → 48 | 4.0 → 4.0 |
+| 342 普通 2×12 | 680.8 → 680.8 | 48 → 48 | 7.2 → 7.2 |
+| 342 普通 3×8 | 632.4 → 632.4 | 48 → 48 | 4.0 → 4.0 |
+| 342 平衡 2×12 | 546.6 → **576.7** | 48 → 48 | 7.2 → 6.0 |
+| 342 平衡 3×8 | 499.0 → **536.1** | 48 → 48 | 4.0 → 4.0 |
+| 333 普通 2×12 | 696.3 → 696.3 | 48 → 48 | 30.0 → 30.0 |
+| 333 普通 3×8 | 641.5 → 641.5 | 48 → 48 | 20.0 → 20.0 |
+| 333 平衡 2×12 | 544.3 → **566.1** | 48 → 48 | 30.0 → 31.2 |
+| 333 平衡 3×8 | 498.0 → **514.6** | 48 → 48 | 20.0 → 20.0 |
+
+- **16/16 通过，最差收支 +4.0**（验收要求 ≥ +4.0，逐格与第 7 步之前同符号：
+  342 平衡 2×12 从 7.2 降到 6.0，其余不变或变好）。
+- `normal`（不搓玉）8 格里有 7 格**逐位不变**——校准只管 O_DIAMOND，这符合预期；
+  只有 243 普通 3×8 变了一点，因为错峰修复把周期从 72h 缩到 48h。
+- `balanced-orundum` 8 格全部上移（+3.3% ~ +20.9%），是**校准口径**造成的（§3 第 7 步），
+  不是算法改进。
+- `243 普通 3×8` 分数略降（563.5 → 561.8）但周期 72h → 48h、最差收支 14.0 → 20.0：
+  错峰修复换掉了一个「心情消耗 +N」的干员，房间产能略降、可持续性明显更好。
+  这说明**「周期更短」和「单房间分数」并不总是同向**，别只看分数。
+
+---
+
+## 5. 基准现状（O_DIAMOND 校准 v2）
+
+**默认 4 场景**（`outputs/benchmark_orundumv2/`，0 胜 3 负 1 平，均比 **0.988**）：
+
+| 场景 | 混合 | 图卷积 | 变化 | 混合耗时 | 图卷积耗时 | 模拟器调用比 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 243 平衡搓玉 2×12 | 402.525 | 402.525 | **±0.00%** | 13.38s | 12.64s | 0.811× |
+| 243 不搓玉 2×12 | 605.566 | 603.177 | −0.39% | 8.36s | 7.81s | 0.788× |
+| 333 平衡搓玉 3×8 auto | 514.645 | 492.625 | −4.28% | 29.21s | 33.01s | 0.877× |
+| 333 极限搓玉 2×12 auto | 486.179 | 485.711 | **−0.10%** | 24.16s | 19.79s | 0.877× |
+
+**这个表不能和下面 §5 的历史表逐格比较**：v1 的 L3 合成玉贸易站对干员免疫（恒 282.000），
+v2 之后同一间房在 123.6~339.6 之间按干员铺开，**所有搓玉类场景的绝对分数整体上移**
+（243 平衡 380.3 → 402.5、333 平衡 498.0 → 514.6、极限搓玉 504.5 → 486.2）。
+变化来源是**校准**，不是搜索算法；混合与图卷积同口径，比较仍然公平。
+
+同一张表能直接读出的两件事：
+- **极限搓玉 −4.42% → −0.10%**：那个差距本来就是「房间对干员免疫 ⇒ 短名单在该房间随机」的病，
+  校准 v2 直接治掉了；
+- **333 平衡搓玉 3×8 仍差 4.28%**：根因是「逐房吃人」+ 错峰周期（§3 第 7 步后半），
+  不是校准问题。修复这两条之前它是 −15.57%。
+
+**5 制造站 252/342**（`outputs/benchmark_252_342_orundumv2/`，2 胜 1 负 1 平，均比 **1.0016**）：
+
+```powershell
+python -m arknights_schedule_generator benchmark --roster .\examples\fixtures\yituliu_full_roster_maxed.xlsx `
+  --data-dir .\data\cache --layouts 252,342 --modes balanced-orundum,normal `
+  --shift-patterns 2x12 --drone-policies none --output-dir .\outputs\benchmark_252_342_orundumv2
+```
+
+| 场景 | 混合 | 图卷积 | 变化 | 模拟器调用比 |
+| --- | --- | --- | --- | --- |
+| 252 平衡搓玉 | 435.225 | 435.225 | **±0.00%** | 0.733× |
+| 252 不搓玉 | 646.577 | 644.897 | −0.26% | 0.583× |
+| 342 平衡搓玉 | 576.744 | **580.903** | **+0.72%** | 1.040× |
+| 342 不搓玉 | 680.768 | **681.893** | **+0.17%** | 0.857× |
+
+**「搓玉稳赢 / 不搓玉稳输」这条规律已经作废。** 现在的符号是：
+搓玉两平一胜（243 ±0、252 ±0、342 +0.72），不搓玉两负一胜（243 −0.39 / 252 −0.26 / 342 +0.17）。
+剩下的小负都是「逐房吃人」（§6 第 9 条），与校准无关。
+
+短名单质量：5/5 命中、**全量最优仍然在短名单里**；top16 召回 1.0 → 0.95
+（O_DIAMOND 从 1.0 掉到 0.75，是「最优那一档并列变多」造成的，不是覆盖缺口）。
+
+---
+
+## 5b. 历史基准（O_DIAMOND 校准 v1，保留作对照）
 
 | 场景 | 混合 | 图卷积 | 变化 | 模拟器调用比 |
 | --- | --- | --- | --- | --- |
@@ -651,19 +790,12 @@ python tools/scan_m1_dormitory.py --output outputs/scan_m1_dormitory.json
 混合算法穷举会碰巧选中休息友好的人。**§3 第 4 步（M1）做完后的结论：这条推断只对了一半** ——
 宿舍分配确实变成一等目标了，但 16 组扫描里最差收支一格都没变、分数也没变，因为
 **心情门槛在满练表上本来就有 +4.0 以上的余量**，宿舍再怎么分都不会改变"谁上场"。
-要缩小 333 的差距，得动**搜索空间**（短名单/起手/插入预算）或**班次结构**（§3 第 3 步），
-不是宿舍分配。
 
 修完第 1、2、4 步之后 243/333 的分数没有变（605.566 / 380.290 / 498.041 全部复现），
 因为这三步只改心情判定、心情模型与宿舍分配。
 
-**252/342 的新对照已经跑完**（心情模型放宽后第一次，2×12、无人机 none）：
-
-```powershell
-python -m arknights_schedule_generator benchmark --roster .\examples\fixtures\yituliu_full_roster_maxed.xlsx `
-  --data-dir .\data\cache --layouts 252,342 --modes balanced-orundum,normal `
-  --shift-patterns 2x12 --drone-policies none --output-dir .\outputs\benchmark_252_342
-```
+**252/342 的第一次对照**（心情模型放宽后，校准 v1，2×12、无人机 none，
+`outputs/benchmark_252_342_m1/`）：
 
 | 场景 | 混合 | 图卷积 | 变化 | 模拟器调用比 |
 | --- | --- | --- | --- | --- |
@@ -675,10 +807,8 @@ python -m arknights_schedule_generator benchmark --roster .\examples\fixtures\yi
 2 胜 2 负，平均分数比 1.000938，平均墙钟比 0.7777，平均模拟器调用比 0.731；短名单 5/5 命中、
 top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_252_342_m1/`），
 墙钟 19.67 / 9.84 / 20.30 / 9.48 秒。
-**规律：搓玉目标稳赢、不搓玉目标稳输**（243/252/342 三组都是这个符号），
-机制见 `docs/graph_optimizer.md` §5 与 §6 第 2 条（合成玉贸易站零梯度 → 短名单在该房间随机，
-混合算法穷举碰巧更好）。下一步要缩小不搓玉的差距，得动搜索空间或班次结构：
-§3 第 4 步（宿舍一等分配）做完后已确认**不是**这个差距的原因（见 §5 的结论）。
+**当时的规律是「搓玉稳赢、不搓玉稳输」**；校准 v2 之后这条作废（见 §5）：342 不搓玉已经变成 +0.17%。
+剩下的不搓玉小负（243 −0.39 / 252 −0.26）才是「逐房吃人」，要动搜索空间或班次结构。
 
 ---
 
@@ -695,6 +825,8 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
   强行做房间级一元项会让制造站 R² 从 0.75 掉到 0.70。
 - 别名阵营标签（rhine/rh、blacksteel/bs、knight/kazimierz）成员集合相同，必须去重，
   否则完全共线。
+- `names` 为空时退回全量枚举（而不是返回空短名单）：实测 342 不搓玉 659.705 vs **681.893**，
+  空短名单让调用方的逐人贪心填房间反而更好。只有 `0 < len(names) < capacity` 才走全量枚举。
 
 ---
 
@@ -731,12 +863,41 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
 | `1e8651e` | M1：宿舍一等分配（上表） |
 | `8b341c4` | 患难之交＝手动心情重置（审计 `version: 4` + `hardshipSwaps` + `HardshipSwapTest` 5 个）；记录 O_DIAMOND 零梯度的真实原因（§2.7）；诊断脚本 `tools/diff_normal_base_decode.py` 等 9 个；§3 第 6 步（M3 规划） |
 
+第 7 步（O_DIAMOND 校准 v2）的改动（最新提交）：
+
+| 文件 | 改动 |
+| --- | --- |
+| `production.py` | 删除 `GUIDE_ORUNDUM_TRADE_LOOKUPS` / `guide_orundum_trade_lookup` / `guide_orundum_lookup_skill_effect_audit`；新增 `ORUNDUM_REFERENCE_*` + `orundum_reference_raw_output()` + `ORUNDUM_ORDER_THROUGHPUT_SCALE`；`evaluate_trading` 的通用分支对 O_DIAMOND 不裁剪订单上限并按常数缩放，审计字段 `calibrationMode: orundum_throughput_v2` |
+| `calibration.py` | `expected_trading` 同步（O_DIAMOND 不裁剪 + 缩放）；`trade_model_summary()["orundumOrder"]` 加 `calibrationVersion: 2` / 参照点 / `throughputScale` |
+| `optimizer.py` | `OPTIMIZER_MODEL_VERSION` 22 → 23；新增 `_morale_rotation_plan`（展开与修复共用的唯一估计入口）/ `_fatiguing_operator_names` / `_relieve_morale_rotation_pressure` / `_replace_fatiguing_room_operators` / `_dormitory_upgrade_or_keep`；`_ensure_sustainable_morale_cycle` 先做减负修复再展开，换人后能直接过门槛就不展开 |
+| `graph_optimizer.py` | `_room_combos`：`0 < len(names) < capacity` 时退回父类全量枚举 |
+| `graph_cache.py` | `CACHE_SCHEMA_VERSION` 2 → 3（读出层按旧标签拟合过，必须重拟合） |
+| `tests/test_production.py` | 删 1 个旧 guide 查表用例，新增 3 个（梯度 / 参照锚点 / 不裁剪） |
+| `tests/test_optimizer.py` | `test_guide_trade_anchor_insertion_prefers_low_level_lmd_room` 改成断言「真的换房 + 补满」；新增 4 个错峰修复用例 + fixture helper |
+| `tests/test_graph_optimizer.py` | 新增 `test_real_shortlist_still_fills_a_room_after_the_top_pool_is_excluded` |
+| `tools/measure_orundum_anchor.py` | 重写成「锚点 + 速度→产出表 + 真实组合分布」三节，输出 `outputs/orundum_anchor.md` |
+| `docs/*` | 本文件 §0/§2.7/§3 第 7 步/§4c/§5/§5b/§6/§7/§8、`graph_optimizer.md` §2.4/§5/§6、`AGENT.md` 搓玉口径 |
+
 ---
 
 ## 8. 陷阱清单
 
-- **下一步是 §3 第 7 步（修 O_DIAMOND 校准）**：第 4 步（M1）已完成，别再当它是待办；
-  也别再拿「M1 能补上不搓玉差距」当前提（§5 已证伪）。第 7 步是第 6 步（房间节点）的先决条件。
+- **下一步是 §3 第 6 步的 M3a（短名单 top-K 精确重排）**：第 7 步已完成，别再当它是待办；
+  O_DIAMOND 已经有梯度了（R² 0.753），M3 的先决条件已满足。
+- **O_DIAMOND 的校准常数只有一处**：`production.ORUNDUM_ORDER_THROUGHPUT_SCALE`（当前 1.0，
+  由 `ORUNDUM_REFERENCE_*` 反解）。改锚点要同时改「参照常量 + 测试 +
+  `tools/measure_orundum_anchor.py` + §5 两张表」。也**不要**去恢复 `guide_orundum_trade_lookup`
+  那种「按 level 无条件命中」的查表——那正是零梯度的来源。
+- **改产能校准必须作废旧缓存**：`graph_cache.CACHE_SCHEMA_VERSION`（读出层标签）与
+  `optimizer.OPTIMIZER_MODEL_VERSION`（candidate 分数）。忘了这一步，基准会拿旧模型报新数字。
+- **不要用「心情消耗 +N」的免费干员填房间**：`fastRotationRooms` 的席位是整块从错峰容量里扣的，
+  一个 +2/h 的会客室干员能把 48h 周期变成 72h（日均分 ÷3）。改房间/换人逻辑时留意
+  `_morale_rotation_plan` 的 `groupCount`。
+- **`_morale_rotation_plan` 是「展开需要几组」的唯一口径**，`_ensure_sustainable_morale_cycle`
+  与 `_relieve_morale_rotation_pressure` 都调它；别在别处再算一遍。
+- **短名单的 `0 < len(names) < capacity` 兜底不要删**：v1 的常数标签掩盖了「房间被填成 2/3」，
+  这个兜底是 v2 之后 333 平衡搓玉不掉 144 分的原因。`names` 为空时**保持**返回空短名单
+  （让调用方逐人贪心填），实测那一支在 342 不搓玉上更好。
 - **宿舍分配不要放回解码热路径**（`_build_shifts` / `_rebuild_dormitories`）：那里一次
   `optimize()` 会调几百次，做 beam 实测 6× 墙钟、最终排班一模一样。beam 只在
   `_ensure_sustainable_morale_cycle` 里对最终排班跑一次。
@@ -749,9 +910,9 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
 - **宿舍分配不能只最大化总恢复**：单目标会让 252/342 的 2×12 最差收支从 7.2 掉到 6.0
   （总恢复反而略高）。现在用三候选 + 审计账本 `(门槛, 最差收支, 总恢复)` 字典序择优；
   改目标函数时一定要重跑 §4 的扫描看 `worstBalance` 有没有掉。
-- **不要再说「合成玉贸易站是零梯度房间」**（`docs/graph_optimizer.md` §6 已更正）：零梯度来自
-  `guide_orundum_trade_lookup` 把速度覆盖成常数 132%（任何 L3 `O_DIAMOND` 都命中），
-  不是数据本身没有信息。修它要先定校准口径，见 §2.7。
+- **不要再把「合成玉贸易站是零梯度房间」写成现状**（`docs/graph_optimizer.md` §6 已更正，
+  §2.7 记着病历）：那是 `guide_orundum_trade_lookup` 把速度覆盖成常数 132% 造成的，
+  校准 v2 之后同一间房是 123.6 ~ 339.6，读出层 R² 也从 −110 回到 0.75。
 - **患难之交按「手动心情重置」建模，不要退回「前一位」**：`morale._apply_hardship_swaps` 只转移
   盈余（`recovery − consumption`）、记在 `consumption += x` 上，所以总收支不变、持有者不会被拖成负数。
   审计 `version: 4` 新增 `hardshipSwaps`；`test_morale.py::HardshipSwapTest` 5 个用例锁住这些性质。

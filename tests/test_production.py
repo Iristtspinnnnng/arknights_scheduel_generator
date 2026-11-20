@@ -3461,37 +3461,91 @@ class ProductionModelTest(unittest.TestCase):
         self.assertEqual(beta.bias, "tailoring_beta")
         self.assertGreater(beta.expected_lmd, alpha.expected_lmd)
 
-    def test_yituliu_orundum_trade_lookup_uses_static_guide_efficiency(self) -> None:
+    def test_orundum_trade_throughput_has_an_operator_gradient(self) -> None:
+        """校准 v2：源石订单的吞吐由干员决定（v1 把速度覆盖成 132%，任何组合都 282）。"""
+        outputs = [self._orundum_12h([speed] * slots) for slots, speed in ((0, 0), (1, 30), (3, 30), (3, 45), (3, 60))]
+        self.assertEqual(outputs, sorted(outputs))
+        self.assertGreater(outputs[-1], outputs[0] * 1.05)
+        self.assertGreater(outputs[3], outputs[2])
+        self.assertNotAlmostEqual(outputs[2], outputs[3])
+
+    def test_orundum_reference_room_still_reproduces_the_guide_anchor(self) -> None:
+        """参照配置（L3 / 3 工位 / +132% 速度 / 12h）必须还是 282.000，guide 与 raw 同口径。"""
+        from arknights_schedule_generator.production import (
+            ORUNDUM_REFERENCE_SPEED_PERCENT,
+            ORUNDUM_ORDER_THROUGHPUT_SCALE,
+            orundum_reference_raw_output,
+        )
+
+        self.assertAlmostEqual(orundum_reference_raw_output(), 282.0, places=6)
+        self.assertAlmostEqual(ORUNDUM_ORDER_THROUGHPUT_SCALE, 1.0, places=9)
+        for profile in ("guide", "raw"):
+            value, report = self._orundum_12h_detail([ORUNDUM_REFERENCE_SPEED_PERCENT], calibration_profile=profile)
+            self.assertAlmostEqual(value, 282.0, places=6)
+            trade_profile = report["tradeOrderProfile"]
+            self.assertEqual(trade_profile["calibrationMode"], "orundum_throughput_v2")
+            self.assertFalse(trade_profile["orderLimitApplied"])
+            self.assertAlmostEqual(trade_profile["throughputScale"], 1.0, places=6)
+            self.assertAlmostEqual(trade_profile["referenceSpeedPercent"], 132.0)
+
+    def test_orundum_trade_does_not_clip_the_static_order_limit(self) -> None:
+        """源石订单一律不裁剪（v2）；龙门币订单仍然受订单上限约束。"""
+        # +200% 速度 ⇒ 18.18 单/12h，远超 L3 的 10 单上限；裁剪后的天花板是 200。
+        value, report = self._orundum_12h_detail([200.0])
+        self.assertAlmostEqual(value, 363.6, places=6)
+        self.assertGreater(value, 200.0)
+        self.assertAlmostEqual(report["vector"]["overflowLoss"], 0.0, places=6)
+        self.assertIsNone(report["capacity"])
+
         with TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
             write_data(data_dir)
             game_data = GameData.load(data_dir)
-            game_data.data_version = "guide-test"
-            simulator = ProductionSimulator(game_data, calibration_profile="guide")
+            simulator = ProductionSimulator(game_data)
+            gold_room = RoomAssignment(
+                "trading_1",
+                "TRADING",
+                "TRADING",
+                "O_GOLD",
+                [skill("A", "TRADING", "order", "订单获取效率+200%", 200.0)],
+                0.0,
+                room_level=3,
+                slots=3,
+            )
+            report = simulator.evaluate([ShiftPlan("A", "08:00", 12, [gold_room], [])])
+
+        self.assertGreater(report.roomReports[0]["vector"]["overflowLoss"], 0.0)
+
+    def _orundum_12h(self, speeds: list[float]) -> float:
+        value, _report = self._orundum_12h_detail(speeds)
+        return value
+
+    def _orundum_12h_detail(
+        self,
+        speeds: list[float],
+        *,
+        calibration_profile: str = "guide",
+    ) -> tuple[float, dict]:
+        with TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_data(data_dir)
+            game_data = GameData.load(data_dir)
+            simulator = ProductionSimulator(game_data, calibration_profile=calibration_profile)
             trade_room = RoomAssignment(
                 "trading_1",
                 "TRADING",
                 "TRADING",
                 "O_DIAMOND",
                 [
-                    skill("A", "TRADING", "order", "订单获取效率+30%", 30),
-                    skill("B", "TRADING", "order", "订单获取效率+30%", 30),
-                    skill("C", "TRADING", "order", "订单获取效率+30%", 30),
+                    skill(chr(ord("A") + index), "TRADING", "order", f"订单获取效率+{speed:g}%", speed)
+                    for index, speed in enumerate(speeds)
                 ],
-                0,
+                0.0,
                 room_level=3,
                 slots=3,
             )
-            report = simulator.evaluate([ShiftPlan("A", "08:00", 24, [trade_room], [])])
-
-        room_report = report.roomReports[0]
-        self.assertAlmostEqual(report.dailyExpected.orundum, 240.0 * 2.35)
-        self.assertAlmostEqual(report.dailyExpected.shardDelta, -24.0 * 2.35)
-        self.assertEqual(
-            room_report["tradeOrderProfile"]["calibrationMode"],
-            "guide_orundum_exact_lookup",
-        )
-        self.assertEqual(room_report["tradeOrderProfile"]["paperEfficiencyPercent"], 132.0)
+            report = simulator.evaluate([ShiftPlan("A", "08:00", 12, [trade_room], [])])
+        return report.dailyExpected.orundum, report.roomReports[0]
 
     def test_yituliu_special_trade_lookup_for_shamare_tequila_butushu(self) -> None:
         with TemporaryDirectory() as temp_dir:
