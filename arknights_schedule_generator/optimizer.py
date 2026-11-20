@@ -442,7 +442,7 @@ class ScheduleOptimizer:
             "status": "fresh",
             "optimizerModelVersion": OPTIMIZER_MODEL_VERSION,
             "maxGroups": DIAGNOSTIC_INSERTION_GROUP_LIMIT,
-            "jointProductionCandidateLimit": JOINT_PRODUCTION_CANDIDATE_LIMIT,
+            "jointProductionCandidateLimit": self.joint_production_candidate_limit(),
             "pureGoldTarget": round(float(pure_gold_target), 6),
             "pureGoldTolerance": round(float(pure_gold_tolerance), 6),
             "maxDroneCycleRepeats": max(1, int(max_drone_cycle_repeats)),
@@ -776,9 +776,14 @@ class ScheduleOptimizer:
         boundary_excluded: set[str],
         *,
         duration_hours: float,
-        candidate_limit: int = JOINT_PRODUCTION_CANDIDATE_LIMIT,
+        candidate_limit: int | None = None,
         beam_width: int = 256,
     ) -> dict[str, RoomAssignment]:
+        # 候选条数走 ``joint_production_candidate_limit()``：图卷积的短名单本来就是
+        # 「全部精确打分 + 按精确分排序」，所以这里限制的是**取前多少条进 beam**，
+        # 子类可以放宽容量（见 ``GraphScheduleOptimizer``）。
+        if candidate_limit is None:
+            candidate_limit = self.joint_production_candidate_limit()
         states: list[tuple[float, set[str], list[RoomAssignment]]] = [(0.0, set(), [])]
         for spec in specs:
             candidates = self._candidate_production_room_assignments(
@@ -861,7 +866,7 @@ class ScheduleOptimizer:
             "source": "diagnostic_named_dependency",
             "optimizerModelVersion": OPTIMIZER_MODEL_VERSION,
             "maxGroups": DIAGNOSTIC_INSERTION_GROUP_LIMIT,
-            "jointProductionCandidateLimit": JOINT_PRODUCTION_CANDIDATE_LIMIT,
+            "jointProductionCandidateLimit": self.joint_production_candidate_limit(),
             "operatorAnchorPreferenceCount": len(self.operator_anchor_preference),
             "availableGroupCount": len(groups),
             "accepted": [],

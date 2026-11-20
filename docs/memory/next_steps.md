@@ -1296,3 +1296,27 @@ small losses are the per-room greedy problem (handoff section 3 step 6, M3).
 Tests: 276 passed / 1 skipped / 1 pre-existing environment failure (missing local yituliu asset).
 New: 3 orundum calibration tests, 4 rotation-repair tests, 1 shortlist-fill regression test.
 Next step: M3a (exact re-ranking of the shortlist top-K).
+
+### P16 addendum - M3a checked and closed as a no-op
+
+Asking "did we do M3a (exact re-rank of the shortlist top-K before the beam)?" turned into an audit of
+that plan item, and the answer is that it was already satisfied and cannot move the score:
+
+- `graph_optimizer._room_combos` already exact-scores **every** shortlisted combo (129..162 of them)
+  with `_score_room_combo` (cached simulator) and sorts the whole list by that exact score, applying the
+  parent's tie rules. `_candidate_production_room_assignments` then takes `[:64]`
+  (`JOINT_PRODUCTION_CANDIDATE_LIMIT`). Re-ranking "the top 8" is therefore a no-op.
+- Widening the candidate count (64 -> 192, covering the full measured shortlist) changed nothing:
+  243 normal 603.177 -> 603.177, 333 balanced-orundum 3x8 492.625 -> 492.625, wall clock roughly doubled.
+  Reverted.
+- Widening the joint beam (256 -> 1024 -> 4096) also changed nothing on both cases (same scores),
+  wall clock 15 -> 22s and 72 -> 110s. Reverted.
+- `tools/probe_m3a_ranks.py` measures where the decoded combo sits in its own exact ranking:
+  min 0 / median 1 / max 63. The worst ones land exactly on the 64-candidate boundary because the
+  60+ better combos all conflict with operators already taken by earlier rooms in the same shift.
+
+So the bottleneck is the joint decision across rooms (and shifts), not the candidate order or count.
+Next step is M3c (rooms x operators joint assignment); M3b (room nodes + affinity matrix) is its natural
+enabler. Small plumbing kept from this audit: `_joint_production_room_assignments` now resolves its
+candidate limit through `joint_production_candidate_limit()`, so the audit fields and the recommender
+cache key share one source of truth.
