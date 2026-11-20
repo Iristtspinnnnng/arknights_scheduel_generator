@@ -1,21 +1,22 @@
 # 接手文档：图卷积优化器 + 心情/宿舍模型
 
 > 写于上下文耗尽前。下一个窗口从这里开始，不必回读聊天记录。
-> 最后更新：第 1、2 步 + 单体宿舍恢复 + 菲亚梅塔（自给自足节点）+ 252/342 基准 +
-> **第 4 步 M1（宿舍做成一等分配目标）都已完成**。
-> **下一个窗口从 §3 第 5 步（办公室选人）或第 3 步（错峰轮转表）开始** —— 两步的现状与落点
-> 都写在 §3；M1 的实测结论见 §3 第 4 步开头与 §5。
+> 最后更新：第 1、2、4 步 + 单体宿舍恢复 + 菲亚梅塔（自律节点 + 患难之交重置）+ 252/342 基准
+> + **M1（宿舍做成一等分配目标）都已完成**；不搓玉差距已定位到「逐房吃人」。
+> **下一个窗口从 §3 第 7 步（修 O_DIAMOND 校准）开始**，那是 M3（房间节点）的先决条件；
+> 然后是 §3 第 6 步的 M3a（短名单 top-K 精确重排），第 5 步（办公室选人）、第 3 步（轮转表）可顺手做。
 
 ---
 
 ## 0. 一分钟速览
 
-- 分支 `main`，**领先 `origin/main` 8 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
+- 分支 `main`，**领先 `origin/main` 10 个提交，未 push**：`8213fb3`（图卷积优化器首版）、
   `c2d39ba`（社区打分权重 + 显式羁绊 + numpy + 缓存 + 多起手）、
   `d78daad`（心情审计改成收支记账 + 老的基准容错/循环上限）、
   `9e1b605`（宿舍绿字 + 作用域减耗 + 控制中枢 + 父类纯赤金 7 天上限），
   三个「单体宿舍恢复的锁定语义」「菲亚梅塔＝自给自足特殊节点」「252/342 基准记录」，
-  以及最新的「M1：宿舍一等分配」（`git log` 可见，内容见 §3 第 4 步与 §5）。
+  `1e8651e`（M1：宿舍一等分配），以及最新的 `8b341c4`（患难之交＝手动心情重置 +
+  记录 O_DIAMOND 零梯度的真实原因）。
 - **§3 第 1、2、4 步已完成**：
   - 判定改成「每个干员一周期收支记账」（审计 `version: 2` → 3 → 现在是 `version: 4`）；
   - 宿舍补上绿字（`0.0004 × 氛围`）、在岗减耗按作用域解析、控制中枢 −0.05/h × 在岗人数；
@@ -27,15 +28,18 @@
     用心情审计自己的账本 `(门槛, 最差收支, 总恢复)` 择优。产能分一格没动，
     总恢复在 7/16 组合上变好，最差收支一格没变差。
   细节见 §2、§3、§4。
+- **不搓玉差距（§3 第 6 步的诊断，已完成）**：−21.06 分里 −20.4 在生产房间的精确分
+  （贸易 −17.3、制造 −8.0 + 若干正项），会客室 0、办公室折算 0.77；机制是**短名单覆盖没问题、
+  但 beam 按预测分逐房吃人**（342 不搓玉的 `trading_2` 选到自己短名单**第 56 名**）。
 - 安全备份分支：`backup/pre-rebase-graph`（rebase 前的原始状态）。
-- 测试：**262 passed / 1 skipped / 1 failed**（新增 `DormitoryFirstClassAssignmentTest` 8 个）。
-  唯一失败是既有环境问题
+- 测试：**270 passed / 1 skipped / 1 failed**（新增 `DormitoryFirstClassAssignmentTest` 11 个、
+  `HardshipSwapTest` 5 个）。唯一失败是既有环境问题
   （`test_calibration_report_examples_pass` 需要仓库外的 `C:\tmp\yituliu_schedule_images_current.js`，
   报 `missing_local_asset`），与本项目改动无关，不要去"修"它。
 - 环境：系统 `python`（WindowsApps，3.13）**没有 pytest**，不能直接跑测试；本轮实际用的是 DSH 自带的
   Python 3.12.14（pytest 9.2.0 / openpyxl 3.1.5）：
   `C:\Users\15455\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe -m pytest tests -q`
-  整套约 75 秒（并发跑基准时会到 95 秒）。`AGENT.md` 里写的 conda 环境在本机不存在。
+  整套约 73 秒（并发跑基准时会到 95 秒）。`AGENT.md` 里写的 conda 环境在本机不存在。
   numpy 2.3.5 可用，但**不要**把 numpy 加进 `pyproject.toml`（用户明确要求）。
 
 ---
@@ -481,6 +485,67 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 （几分钟）；`docs/graph_optimizer.md` §6 记的「短名单顺序敏感（±3%）」和「样本越多越差」
 两条都要在这个新形态下重测，不能直接沿用旧结论。
 
+### 第 7 步：修 O_DIAMOND 校准（**下个窗口从这里开始**）
+
+**为什么先做这一步。** 现在模型里三级源石订单贸易站对干员**完全免疫**（§2.7），
+搓玉有三分之一的房间是常数，读出层在那间房只能学到噪声（holdout R² = −110）。
+不修它，第 6 步的房间节点在搓玉侧没有梯度，M3 的效果会被这半边直接吃掉。
+用户已经确认这**不是游戏事实**：源石订单吞吐吃贸易站干员生产力、源石碎片产出吃制造站
+「源石类配方」生产力。
+
+**病灶**：`production.py::guide_orundum_trade_lookup`（:1160）只匹配 `target` + `room_level`，
+命中后 `_simulate_trade_room`（:955-969）把 `speed_percent` **覆盖**成
+`paperEfficiencyPercent = 132`，并用未裁剪的 `raw_orders`（:1050-1052 里
+`guide_orundum_order` 跳过订单上限）。所以任何 L3 `O_DIAMOND` 房间、任何干员组合，
+12h 都恰好产出 **282.000** orundum。
+
+**已测好的锚点**（`outputs/orundum_anchor.md`，脚本 `tools/measure_orundum_anchor.py`）：
+
+| 口径 | 12h 产出 | 说明 |
+| --- | --- | --- |
+| guide（速度被覆盖成 132%） | **282.000** | 现状，所有组合相同 |
+| raw，速度 +0% | 123.600 | 线性段 |
+| raw，速度 +32%（单人） | 162.000 | = 123.6 × 1.32，线性 |
+| raw，速度 +32%×3 | 200.000 | **被订单上限裁剪**（见下） |
+| raw，速度 +60% / +100% | 195.6 / 200.0 | 均被上限压平 |
+
+**做法（建议）**：
+1. 让 O_DIAMOND 走和其他贸易站同一条路：`trade_order_profile` + `room_speed_multiplier`，
+   `speed_percent` 来自干员（不再覆盖）。
+2. **保留「O_DIAMOND 不裁剪订单上限」**（`guide_orundum_order` 那个分支），
+   理由是源石碎片供给才是真约束、订单银行不是；否则 +32%×3 就已经到 200 的天花板、
+   梯度又没了（表里那一行就是证据）。
+3. 乘一个**单一常数**把绝对量级锚回原状：参照速度 132% 时仍是 282/12h。
+   按上表，raw 的裸值在 132% 时约 163.2（=123.6×1.32），所以 **r ≈ 282/163.2 ≈ 1.728**。
+   这个 r 就是唯一新增的校准常数，要写进 `assumptions` 和文档，并在测试里钉住
+   「参照速度 132% ⇒ 282.000」。
+4. 参照速度的定义（「132% 纸面效率、无中枢加成、L3、12h」）写死成常量+测试，
+   以后改锚点必须同时改测试与 §5 表。
+
+**会踩到的点**：
+- `guides` 里那条 `GUIDE_ORUNDUM_TRADE_LOOKUPS` 只剩「锚点」语义，不要再按 level 无条件命中；
+  要么删掉查表、要么把它降级成 `reference 132%` 的常量。
+- `tests/test_production.py` 里断言 orundum/校准用例的期望值会变（搜 `orundum`、`282`、
+  `O_DIAMOND`），要按新口径重写期望，**不要**为了过测试把 r 调回去。
+- `calibration.py` 的 `atomic_case("trade_orundum_l3_12h", ...)`、`modeled[...]` 那几条
+  也会一起变（`calibration.py:2064-2110`）。
+- 基准会动：搓玉场景（243/252/342 balanced、333 max）的 orundum 与总分都会变。
+  **必须重记 §5 两张表**，并在表头写明「O_DIAMOND 校准 v2」；混合与图卷积同口径，比较仍公平。
+- 不要顺手改 `SHARDS_PER_ORUNDUM_ORDER` / `ORUNDUM_PER_SHARD_ORDER`（2 碎片 → 20 玉是硬事实），
+  只调「吞吐 × 常数」。
+
+**验收**：
+1. `pytest tests -q` 全绿（除既有的 `missing_local_asset`），新增 2-3 个测试：
+   - 同一批 O_DIAMOND 组合现在**有梯度**（最强 vs 最弱相差 > 5%）；
+   - 参照组合仍复现 282/12h（把 r 与参照写死）；
+   - 干员技能 +速度时 orundum 单调上升（不再被上限压平）。
+2. 4 场景 + 252/342 基准重跑，把 §5 两张表换成新数字，并在文档里说明「本次数字变化来自校准，
+   不是算法改进」。
+3. 16 组可行性扫描仍全过、最差收支 ≥ +4.0。
+4. 图卷积在 O_DIAMOND 上的 holdout R² 从 −110 变成有意义的正数（`graph_benchmark` 的模型表）。
+
+**之后**：回到 §3 第 6 步的 M3a（短名单 top-K 精确重排），再做 M3b/c。
+
 ---
 
 ## 4. 复现用的诊断脚本
@@ -499,7 +564,8 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
 outputs/normal_gap_summary.md      四个场景的分数构成差异
 outputs/normal_gap_342.md          342 不搓玉：四个班次族逐房间差异
 outputs/base_decode_342.md         342 不搓玉：基础解码层差异 + 短名单名次
-outputs/shard_probe.md             O_DIMOND 是否吃干员（guide 全 282 / raw 200~220）
+outputs/shard_probe.md             O_DIAMOND 是否吃干员（guide 全 282 / raw 200~220）
+outputs/orundum_anchor.md          第 7 步的锚点：0/32/60/100% 速度对应的 12h 产出与缩放比 r
 outputs/hardship_impact.md         四个基准场景是否触发患难之交（否）
 ```
 
@@ -658,12 +724,19 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
 | `tools/` | 新增 `scan_m1_dormitory.py` / `time_one_case.py` / `inspect_one_case.py` / `inspect_worst_balance.py` / `check_generate_outputs.py` |
 | `docs/*` | 本文件 §0/§3/§4/§5/§7/§8、`graph_optimizer.md` §5b、`AGENT.md` 心情口径 |
 
+第 5 步之前的两次追加（都未 push）：
+
+| 提交 | 内容 |
+| --- | --- |
+| `1e8651e` | M1：宿舍一等分配（上表） |
+| `8b341c4` | 患难之交＝手动心情重置（审计 `version: 4` + `hardshipSwaps` + `HardshipSwapTest` 5 个）；记录 O_DIAMOND 零梯度的真实原因（§2.7）；诊断脚本 `tools/diff_normal_base_decode.py` 等 9 个；§3 第 6 步（M3 规划） |
+
 ---
 
 ## 8. 陷阱清单
 
-- **下一步是 §3 第 5 步（办公室选人）或第 3 步（错峰轮转表）**。第 4 步（M1）已完成，
-  别再当它是待办；也别再拿"M1 能补上不搓玉差距"当前提（§5 已证伪）。
+- **下一步是 §3 第 7 步（修 O_DIAMOND 校准）**：第 4 步（M1）已完成，别再当它是待办；
+  也别再拿「M1 能补上不搓玉差距」当前提（§5 已证伪）。第 7 步是第 6 步（房间节点）的先决条件。
 - **宿舍分配不要放回解码热路径**（`_build_shifts` / `_rebuild_dormitories`）：那里一次
   `optimize()` 会调几百次，做 beam 实测 6× 墙钟、最终排班一模一样。beam 只在
   `_ensure_sustainable_morale_cycle` 里对最终排班跑一次。
