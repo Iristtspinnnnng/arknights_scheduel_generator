@@ -636,8 +636,15 @@ O_DIAMOND 的 top16 召回从 1.0 掉到 0.75 不是覆盖缺口（全量最优�
    的 44.72（342 的 `trading_2`）。混合算法是穷举 + 跨房间的插入/替换，所以能保住
    「需要三个指定干员」的组合。校准 v2 之后同一现象出现在 O_DIAMOND 上（333 平衡搓玉 3×8：
    图卷积把最强三人组 202.4 放进一个班次，另外两个班次只剩 118.4/154.4）。
-   **修法见 handoff §3 第 6 步（M3）：房间节点 ↔ 干员节点匹配，
-   第一步是短名单 top-K 用精确分重排。**
+   **修法见 handoff §3 第 6 步（M3）。**
+11. **M3b 已做完，且把第 9 条的原因量得更准了（2026-11）。**
+    房间节点 + 共享亲和度矩阵见 §2.8：读数质量确实更好（36 个规格里 30 个 R² 更高），
+    但端到端 3 胜 2 负 3 平，两次退步都发生在**产能分之外的全局决策**上——
+    333 极限搓玉是一个房间差 6 分就让源石碎片日差从 −0.12 变成 +8.79（`shardBalance` −104），
+    252 平衡搓玉是目标组合从「2 经验 + 2 龙门币」换成「1 经验 + 3 龙门币」（`exp` −56）。
+    所以「逐房吃人」有两个层次：**(a) 同一班次内抢干员**（第 9 条），
+    **(b) 让全局收支/目标组合落到另一个盆地**（本条）。只修 (a) 的 M3c 又因候选池结构死路，
+    要动 (b) 得先让解码看得见碎片/赤金/经验收支——那是打分口径的改动，不是读出层的改动。
 
 ---
 
@@ -645,13 +652,15 @@ O_DIAMOND 的 top16 召回从 1.0 掉到 0.75 不是覆盖缺口（全量最优�
 
 | 文件 | 职责 |
 | --- | --- |
-| `arknights_schedule_generator/graph_features.py` | 静态图构建 + `graph-audit` 体检报告 |
-| `arknights_schedule_generator/graph_conv.py` | 固定超参图卷积 + 闭式岭回归读出层（含 numpy 加速路径） |
+| `arknights_schedule_generator/graph_features.py` | 静态图构建（干员图 + **房间节点图**）+ `graph-audit` 体检报告 |
+| `arknights_schedule_generator/graph_conv.py` | 固定超参图卷积 + 闭式岭回归读出层（含 numpy 加速路径）；**房间编码器 + 共享亲和度读出层（M3b）** |
 | `arknights_schedule_generator/graph_bonds.py` | 显式羁绊基（阵营人数 / 点名羁绊指示函数） |
 | `arknights_schedule_generator/graph_cache.py` | 读出层与机制超边的磁盘缓存 |
-| `arknights_schedule_generator/graph_optimizer.py` | `GraphScheduleOptimizer`，继承 `ScheduleOptimizer` 的全部约束逻辑 |
+| `arknights_schedule_generator/graph_optimizer.py` | `GraphScheduleOptimizer`，继承 `ScheduleOptimizer` 的全部约束逻辑；`readout` 选两种读出层 |
 | `arknights_schedule_generator/graph_benchmark.py` | 对照基准（JSON + Markdown） |
-| `tests/test_graph_optimizer.py` | 图构建 / 编码器 / 读出层 / 优化器契约 / 真实数据回归 |
+| `tests/test_graph_optimizer.py` | 图构建 / 编码器 / 读出层 / 优化器契约 / 真实数据回归 / **房间节点 + 亲和度读出层** |
+| `tools/probe_affinity_readout.py` | M3b 读数质量对照（每房一套 vs 亲和度） |
+| `tools/diff_m3b_readouts.py` | M3b 同一场景两种读出层的逐房间差分 |
 
 CLI：
 
