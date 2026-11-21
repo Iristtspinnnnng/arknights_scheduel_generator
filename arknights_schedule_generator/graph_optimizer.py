@@ -27,14 +27,27 @@ from typing import Any, Sequence
 from .graph_bonds import BondBasis, build_bond_basis
 from .graph_cache import GraphModelCache
 from .graph_conv import (
+    AffinityFitRoom,
     EncoderConfig,
     GraphEncoder,
+    RoomAffinityModel,
+    RoomCondition,
+    RoomEncoder,
+    RoomEncoderConfig,
     RoomQuery,
     RoomValueModel,
+    fit_room_affinity_model,
     fit_room_value_model,
+    numpy_available,
     rank_combinations,
 )
-from .graph_features import StaticOperatorGraph, build_operator_graph
+from .graph_features import (
+    ROOM_CATALOG,
+    StaticOperatorGraph,
+    StaticRoomGraph,
+    build_operator_graph,
+    build_room_graph,
+)
 from .models import BaseSkill
 from .optimizer import (
     COMBO_CANDIDATE_TOP_LIMIT,
@@ -65,10 +78,18 @@ from .production import (
 __all__ = ["GraphScheduleOptimizer", "GraphOptimizerConfig", "GRAPH_OPTIMIZER_MODEL_VERSION"]
 
 # 和父类区分开，避免推荐器的候选缓存在两种算法之间串用。
-GRAPH_OPTIMIZER_MODEL_VERSION = 100 + OPTIMIZER_MODEL_VERSION
+# +1：M3b 把读出层的形态改成了「房间节点 × 干员嵌入」的共享亲和度矩阵，
+# 同一份排班候选在两种读出层下的房间分不同，所以候选缓存必须整体作废一次。
+GRAPH_OPTIMIZER_MODEL_VERSION = 101 + OPTIMIZER_MODEL_VERSION
 
 # 特征定义版本：改动节点特征 / 羁绊基 / 读出层结构时必须 +1，否则旧磁盘缓存会失效。
 FEATURE_VERSION = 2
+
+# 共享亲和度矩阵（M3b）的读出层版本；改 ``RoomEncoder`` / 设计矩阵布局 / 采样方案时必须 +1。
+# 2：采样改成「一半预算给满编组合」（``graph_conv._sample_affinity_combos``）。
+AFFINITY_READOUT_VERSION = 2
+
+_READOUTS = {"per_room", "affinity"}
 
 _ROOM_QUERY_ROOM_TYPES = {"TRADING", "MANUFACTURE", "POWER"}
 
@@ -136,9 +157,36 @@ class GraphOptimizerConfig:
     """每轮最多尝试多少个插入组（父类上限是 64，`DIAGNOSTIC_INSERTION_GROUP_LIMIT`）。"""
     insertion_max_passes: int = 4
     """插入搜索的最大轮数（父类最多 8 轮）。"""
+    readout: str = "per_room"
+    """读出层的形态（M3b）。
+
+    * ``per_room``：每间房（房型 × 产物 × 等级 × 工位 × 时长）各拟合一套一元/二元权重。
+      这是校准 v2 以来的现状。
+    * ``affinity``：一条**共享**的「房间节点嵌入 × 干员嵌入」双线性读出层
+      （``graph_conv.RoomAffinityModel``）。同一张表可以给任意「房间 × 干员」对打分，
+      也能把任意房间规格物化成 ``RoomValueModel``，下游代码一行都不用改。
+      需要 numpy（闭式解是 1600 维的设计矩阵），没有 numpy 时自动退回 ``per_room``。
+
+    两种形态的读数质量与最终排班分数见 ``docs/handoff_graph_optimizer.md`` §3 第 6 步 M3b。"""
+    affinity_samples: int = 256
+    """共享读出层**每个房间规格**的采样数（总计 = 规格数 × 这个值）。"""
+    affinity_ridge: float = 4.0
+    affinity_bond_ridge: float = 1.0
+    affinity_levels: tuple[int, ...] = (1, 2, 3)
+    """池化拟合覆盖的房间等级；等级是房间嵌入的查询尾巴，不在训练集里的等级靠外推。"""
+    affinity_durations: tuple[float, ...] = (8.0, 12.0)
+    """池化拟合覆盖的班次时长（小时）。"""
 
     def encoder_config(self) -> EncoderConfig:
         return EncoderConfig(hidden_dim=self.hidden_dim, layers=self.layers, seed=self.seed)
+
+    @property
+    def uses_affinity_readout(self) -> bool:
+        """实际生效的读出层是否共享亲和度矩阵（无 numpy 时强制退回 ``per_room``）。"""
+        return self.readout == "affinity" and numpy_available()
+
+    def room_encoder_config(self) -> RoomEncoderConfig:
+        return RoomEncoderConfig(seed=self.seed)
 
 
 class GraphScheduleOptimizer(ScheduleOptimizer):
@@ -168,6 +216,11 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         self.graph_config = graph_config or GraphOptimizerConfig()
         self._graph: StaticOperatorGraph | None = None
         self._encoder: GraphEncoder | None = None
+        self._room_graph: StaticRoomGraph | None = None
+        self._room_encoder: RoomEncoder | None = None
+        self._affinity: RoomAffinityModel | None = None
+        self._affinity_loaded = False
+        self._affinity_views: dict[tuple[Any, ...], RoomValueModel] = {}
         self._models: dict[tuple[Any, ...], RoomValueModel | None] = {}
         self._unary_cache: dict[tuple[Any, ...], dict[str, float]] = {}
         self._pair_cache: dict[tuple[Any, ...], dict[tuple[str, str], float]] = {}
@@ -324,6 +377,169 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         return self._embedding_by_name
 
     # ------------------------------------------------------------------
+    # 房间节点（M3b）
+    # ------------------------------------------------------------------
+    def room_graph(self) -> StaticRoomGraph:
+        if self._room_graph is None:
+            self._room_graph = build_room_graph(self.game_data)
+        return self._room_graph
+
+    def room_encoder(self) -> RoomEncoder:
+        if self._room_encoder is None:
+            self._room_encoder = RoomEncoder(
+                self.room_graph(), self.graph_config.room_encoder_config()
+            )
+            self.graph_stats["roomGraph"] = self._room_encoder.profile()
+        return self._room_encoder
+
+    def affinity_model(self) -> RoomAffinityModel | None:
+        """共享「房间 × 干员」亲和度矩阵；``None`` 表示不可用（无 numpy / 样本不足）。"""
+        if not self._affinity_loaded:
+            self._affinity = self._ensure_affinity_model()
+            self._affinity_loaded = True
+        return self._affinity
+
+    def affinity_matrix(
+        self,
+        conditions: Sequence[RoomCondition],
+        names: Sequence[str] | None = None,
+    ) -> list[dict[str, float]]:
+        """``房间 × 干员`` 的亲和度矩阵（M3b 的对外形态，供匹配/定价使用）。
+
+        这是「每间房各拟合一套」做不到的事：同一张表能跨房间给任意干员打分，
+        不需要该房间曾经被拟合过。
+        """
+        model = self.affinity_model()
+        if model is None:
+            return []
+        embeddings = self._embeddings()
+        operators = list(names) if names is not None else list(embeddings)
+        return model.affinity_matrix(conditions, operators, embeddings)
+
+    def _ensure_affinity_model(self) -> RoomAffinityModel | None:
+        if not self.graph_config.uses_affinity_readout:
+            return None
+        config = self.graph_config
+        rooms = self._affinity_fit_rooms()
+        if len(rooms) < 2:
+            return None
+        encoder = self.room_encoder()
+        candidate_signature = "|".join(
+            f"{room.condition.room_type}:{room.condition.target}:"
+            f"{room.condition.room_level}:{round(room.condition.duration_hours, 3)}:"
+            f"{len(room.candidates)}:{','.join(sorted(room.candidates)[:4])}"
+            for room in rooms
+        )
+        cache_key = self._cache.key(
+            {
+                "kind": "room_affinity_model",
+                "graph": self.graph().meta.get("signature"),
+                "roomGraph": self.room_graph().meta.get("signature"),
+                "readoutVersion": AFFINITY_READOUT_VERSION,
+                "featureVersion": FEATURE_VERSION,
+                "roomEncoder": encoder.config.to_dict(),
+                "embeddingDim": self.encoder().embedding_dim,
+                "samples": config.affinity_samples,
+                "sampling": "half_full_combo",
+                "ridge": config.affinity_ridge,
+                "bondRidge": config.affinity_bond_ridge,
+                "levels": list(config.affinity_levels),
+                "durations": list(config.affinity_durations),
+                "seed": config.seed,
+                "rooms": candidate_signature,
+            }
+        )
+        cached = self._cache.load(cache_key)
+        if cached and cached.get("model"):
+            try:
+                model = RoomAffinityModel.from_dict(cached["model"], self.room_graph())
+                self._record_runtime_count("graphAffinity.cacheHit")
+                self._store_affinity_stats(model, cached=True)
+                return model
+            except (KeyError, TypeError, ValueError):
+                pass
+        self._record_runtime_count("graphAffinity.cacheMiss")
+        model = fit_room_affinity_model(
+            encoder,
+            self._embeddings(),
+            rooms,
+            samples=config.affinity_samples,
+            seed=config.seed,
+            ridge=config.affinity_ridge,
+            bond_ridge=config.affinity_bond_ridge,
+        )
+        self._store_affinity_stats(model, cached=False)
+        if model is not None:
+            self._cache.save(cache_key, {"model": model.to_dict()})
+        return model
+
+    def _store_affinity_stats(
+        self, model: RoomAffinityModel | None, *, cached: bool
+    ) -> None:
+        self.graph_stats["affinityReadout"] = (
+            {"available": False} if model is None else {**model.describe(), "fromCache": cached}
+        )
+
+    def _affinity_fit_rooms(self) -> list[AffinityFitRoom]:
+        """池化拟合用的房间规格目录。
+
+        与基建布局**无关**（房型 × 产物 × 等级 × 时长的固定笛卡尔积），所以拟合结果
+        跨布局、跨进程复用；任一具体房间只是这张表上的一个查询点。
+        """
+        config = self.graph_config
+        rooms: list[AffinityFitRoom] = []
+        for room_type, target in ROOM_CATALOG:
+            if room_type in {"MEETING", "HIRE", "DORMITORY"}:
+                # 这三类不走图读出层（会客/办公/宿舍的选人口径是规则化的），
+                # 拟合它们只会把噪声带进共享表。
+                continue
+            for level in config.affinity_levels:
+                slots = self._room_capacity(room_type, level)
+                for duration in config.affinity_durations:
+                    spec = RoomSpec(
+                        f"affinity_{room_type.lower()}_{level}_{int(duration)}",
+                        room_type,
+                        target,
+                        slots,
+                        level,
+                        slots,
+                    )
+                    variants = self._best_variant_map(spec, duration)
+                    if not variants:
+                        continue
+                    fatigue = self._fatigue_extra(spec, duration)
+
+                    def oracle(
+                        combo: tuple[str, ...],
+                        _spec: RoomSpec = spec,
+                        _variants: dict[str, BaseSkill] = variants,
+                        _duration: float = duration,
+                        _fatigue: dict[str, float] = fatigue,
+                    ) -> float:
+                        operators = [_variants[name] for name in combo if name in _variants]
+                        if not operators:
+                            return 0.0
+                        raw = self._score_room_combo(_spec, operators, _duration)
+                        return raw - sum(_fatigue.get(name, 0.0) for name in combo)
+
+                    rooms.append(
+                        AffinityFitRoom(
+                            condition=RoomCondition(
+                                room_type=room_type,
+                                target=target,
+                                room_level=level,
+                                slots=slots,
+                                duration_hours=duration,
+                            ),
+                            candidates=tuple(sorted(variants)),
+                            capacity=slots,
+                            oracle=oracle,
+                            bond_basis=self._bond_basis(spec, duration, variants),
+                        )
+                    )
+        return rooms
+
+    # ------------------------------------------------------------------
     # 房间价值模型
     # ------------------------------------------------------------------
     def _model_key(self, spec: RoomSpec, duration_hours: float) -> tuple[Any, ...]:
@@ -453,6 +669,12 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         key = self._model_key(spec, duration_hours)
         if key in self._models:
             return self._models[key]
+        if self.graph_config.uses_affinity_readout:
+            affinity_view = self._affinity_room_model(spec, duration_hours)
+            if affinity_view is not None:
+                self._models[key] = affinity_view
+                self._store_model_stats(spec, affinity_view)
+                return affinity_view
         config = self.graph_config
         encoder = self.encoder()
         variants = self._best_variant_map(spec, duration_hours)
@@ -528,6 +750,39 @@ class GraphScheduleOptimizer(ScheduleOptimizer):
         self.graph_stats["models"][
             f"{spec.room_type}:{spec.target}:{spec.room_level}:{spec.slots}"
         ] = None if model is None else model.describe()
+
+    def _affinity_room_model(
+        self, spec: RoomSpec, duration_hours: float
+    ) -> RoomValueModel | None:
+        """把共享亲和度矩阵物化成该房间规格的读数层（M3b）。
+
+        物化结果与排除集**无关**（亲和度只取决于房间规格），所以按规格缓存一次即可。
+        目录外的房间（例如未来新增的产物）或没有 numpy 时返回 ``None``，
+        调用方会退回每间房各自拟合的路径，行为与校准 v2 一致。
+        """
+        if (spec.room_type, spec.target) not in ROOM_CATALOG:
+            return None
+        key = ("affinity_view", spec.room_type, spec.target, spec.room_level, spec.slots,
+               round(float(duration_hours), 6))
+        cached = self._affinity_views.get(key)
+        if cached is not None:
+            return cached
+        model = self.affinity_model()
+        if model is None:
+            return None
+        if not self._best_variant_map(spec, duration_hours):
+            return None
+        condition = RoomCondition(
+            room_type=spec.room_type,
+            target=spec.target,
+            room_level=spec.room_level,
+            slots=spec.slots if spec.slots is not None else spec.capacity,
+            duration_hours=float(duration_hours),
+        )
+        view = model.view(condition)
+        self._affinity_views[key] = view
+        self._record_runtime_count("graphAffinity.viewMaterialized")
+        return view
 
     def _bond_basis(
         self,

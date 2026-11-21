@@ -74,8 +74,13 @@ conda run -n arknights-schedule-generator python -m arknights_schedule_generator
   - `hybrid`（默认，`optimizer.py`）：房间组合全量枚举 + 插入/替换局部搜索。
   - `graph`（`graph_optimizer.py`）：固定超参图卷积短名单 + 同模拟器精确复核。
     数据审计、算法与实测对照见 `docs/graph_optimizer.md`。
-- 实测（满练 447 行练度表，同进程）：图卷积综合分平均 **1.030 倍**，模拟器调用 **0.672 倍**，
-  墙钟约持平；逐房间短名单在 5/5 采样规格上仍取到全量枚举最优。
+    它有两种读出层形态（`GraphOptimizerConfig.readout`）：`per_room`（默认，每间房各拟合一套）
+    与 `affinity`（M3b：房间节点 × 干员嵌入的共享亲和度矩阵；读数更准但排班分数 3 胜 2 负 3 平，
+    所以**默认不开**）。细节见 handoff §3 第 6 步 M3b 与 `docs/graph_optimizer.md` §2.8。
+- 实测（满练 447 行练度表，校准 v2 口径）：图卷积 vs 混合 **0 胜 3 负 1 平、平均分数比 0.988**，
+  模拟器调用 0.833 倍、墙钟 0.956 倍；252/342 是 1 胜 2 负 1 平、0.993。
+  逐房间短名单在 5/5 采样规格上仍取到全量枚举最优。
+  （历史上那条「平均 1.030 倍」是校准 v2 之前的旧口径，不要再引用。）
 - 图卷积的静态图信息来自 `data/cache`：55 个阵营组、36 对技能点名羁绊、2252 条组合机制边。
   数值强度不在数据字段里（`buff.efficiency` 多为 0），所以读出层用 `ProductionSimulator` 当老师标定。
 - 一图流 2026-06「泡影苍霆」版本样例已作为主要校准源：

@@ -25,18 +25,27 @@ from arknights_schedule_generator.graph_bonds import (
 )
 from arknights_schedule_generator.graph_cache import CACHE_SCHEMA_VERSION, GraphModelCache
 from arknights_schedule_generator.graph_conv import (
+    AffinityFitRoom,
     EncoderConfig,
     GraphEncoder,
+    RoomAffinityModel,
+    RoomCondition,
+    RoomEncoder,
+    RoomEncoderConfig,
     RoomQuery,
     _solve_ridge,
     _spearman,
+    fit_room_affinity_model,
     fit_room_value_model,
     numpy_available,
     rank_combinations,
 )
 from arknights_schedule_generator.graph_features import (
     FEATURE_NAMES,
+    ROOM_CATALOG,
+    ROOM_FEATURE_NAMES,
     build_operator_graph,
+    build_room_graph,
 )
 from arknights_schedule_generator.graph_optimizer import (
     GRAPH_OPTIMIZER_MODEL_VERSION,
@@ -171,6 +180,27 @@ def write_graph_test_data(data_dir: Path) -> None:
     )
     (data_dir / "item_table.json").write_text(json.dumps({}), encoding="utf-8")
     (data_dir / "data_version.txt").write_text("test", encoding="utf-8")
+
+
+def write_room_graph_test_data(data_dir: Path) -> None:
+    """在最小数据集上补上房间图需要的两样东西：每级耗电、中枢减耗。"""
+    write_graph_test_data(data_dir)
+    path = data_dir / "building_data.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    electricity = {
+        "CONTROL": 0,
+        "TRADING": -10,
+        "MANUFACTURE": -10,
+        "POWER": 60,
+        "DORMITORY": -10,
+        "MEETING": -10,
+        "HIRE": -20,
+    }
+    for room_type, record in payload["rooms"].items():
+        for phase in record.get("phases") or []:
+            phase["electricity"] = electricity.get(room_type, 0)
+    payload["controlData"] = {"basicCostBuff": -5}
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def build_test_roster() -> list[RosterOperator]:
@@ -492,6 +522,279 @@ class GraphOptimizerContractTest(unittest.TestCase):
             hybrid._combo_candidate_pool("TRADING", "O_GOLD", set()),
             graph._combo_candidate_pool("TRADING", "O_GOLD", set()),
         )
+
+
+class RoomNodeGraphTest(unittest.TestCase):
+    """M3b：房间节点 + 发电站/控制中枢的结构边。"""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.data_dir = Path(self._temp.name)
+        write_room_graph_test_data(self.data_dir)
+        self.game_data = GameData.load(self.data_dir)
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def test_room_graph_covers_the_catalog_with_structural_edges(self) -> None:
+        graph = build_room_graph(self.game_data)
+        self.assertEqual(graph.size, len(ROOM_CATALOG))
+        report = graph.audit_report()
+        self.assertEqual(report["featureWidth"], len(ROOM_FEATURE_NAMES))
+        self.assertEqual(set(report["edgeCountByRelation"]), {"power", "control"})
+        self.assertGreater(report["edgeCountByRelation"]["power"], 0)
+        self.assertGreater(report["edgeCountByRelation"]["control"], 0)
+        # 发电站供电 → 每间耗电房都有一条 power 入边；控制中枢 → 每个房间一条 control 入边。
+        trading = graph.node("TRADING", "O_GOLD")
+        self.assertIsNotNone(trading)
+        assert trading is not None
+        relations = {relation for _node, relation, _weight in graph.neighbours("TRADING", "O_GOLD")}
+        self.assertEqual(relations, {"power", "control"})
+
+    def test_room_features_come_from_building_data(self) -> None:
+        graph = build_room_graph(self.game_data)
+        index = {name: position for position, name in enumerate(ROOM_FEATURE_NAMES)}
+        power = graph.node("POWER", None)
+        trading = graph.node("TRADING", "O_GOLD")
+        assert power is not None and trading is not None
+        # 发电站供电、耗电房耗电：符号必须相反（否则「谁给谁供电」就不是结构信息了）。
+        self.assertGreater(power.features[index["powerPerSlot"]], 0)
+        self.assertLess(trading.features[index["powerPerSlot"]], 0)
+        self.assertEqual(trading.features[index["capacity"]], 3.0 / 5.0)
+        self.assertEqual(trading.features[index["isResourceRoom"]], 1.0)
+        self.assertEqual(power.features[index["isPowerRoom"]], 1.0)
+
+    def test_room_graph_is_deterministic(self) -> None:
+        first = build_room_graph(self.game_data)
+        second = build_room_graph(self.game_data)
+        self.assertEqual(first.meta["signature"], second.meta["signature"])
+        self.assertEqual(
+            [node.features for node in first.nodes],
+            [node.features for node in second.nodes],
+        )
+
+
+class RoomAffinityReadoutTest(unittest.TestCase):
+    """M3b：一条共享读出层同时给多间房打分（房间节点 × 干员嵌入的双线性读出）。"""
+
+    def setUp(self) -> None:
+        self._temp = TemporaryDirectory()
+        self.data_dir = Path(self._temp.name)
+        write_graph_test_data(self.data_dir)
+        self.game_data = GameData.load(self.data_dir)
+        self.roster = build_test_roster()
+        self.graph = build_operator_graph(self.game_data, self.roster)
+        self.encoder = GraphEncoder(self.graph, EncoderConfig(hidden_dim=10, layers=2))
+        self.embeddings = {
+            node.name: vector for node, vector in zip(self.graph.nodes, self.encoder.embeddings())
+        }
+        self.room_encoder = RoomEncoder(build_room_graph(self.game_data), RoomEncoderConfig())
+        self.trading_names = [name for name, *_ in TRADING_OPERATORS]
+        self.manufacture_names = [name for name, *_ in MANUFACTURE_OPERATORS]
+
+    def tearDown(self) -> None:
+        self._temp.cleanup()
+
+    def _two_room_oracle_model(self) -> RoomAffinityModel | None:
+        """TRADING 想要 embedding[0] 大的干员，MANUFACTURE 想要 embedding[1] 大的。"""
+
+        def trading_oracle(combo: tuple[str, ...]) -> float:
+            return 50.0 * sum(self.embeddings[name][0] for name in combo)
+
+        def manufacture_oracle(combo: tuple[str, ...]) -> float:
+            return 50.0 * sum(self.embeddings[name][1] for name in combo)
+
+        rooms = [
+            AffinityFitRoom(
+                condition=RoomCondition("TRADING", "O_GOLD", level, 1, 12.0),
+                candidates=tuple(sorted(self.trading_names)),
+                capacity=1,
+                oracle=trading_oracle,
+            )
+            for level in (1, 2)
+        ] + [
+            AffinityFitRoom(
+                condition=RoomCondition("MANUFACTURE", "F_GOLD", level, 1, 12.0),
+                candidates=tuple(sorted(self.manufacture_names)),
+                capacity=1,
+                oracle=manufacture_oracle,
+            )
+            for level in (1, 2)
+        ]
+        return fit_room_affinity_model(
+            self.room_encoder,
+            self.embeddings,
+            rooms,
+            samples=48,
+            seed=5,
+            ridge=0.5,
+        )
+
+    def test_room_embedding_depends_on_room_and_query(self) -> None:
+        base = RoomCondition("TRADING", "O_GOLD", 3, 3, 12.0)
+        higher_level = RoomCondition("TRADING", "O_GOLD", 1, 3, 12.0)
+        other_room = RoomCondition("MANUFACTURE", "F_GOLD", 3, 3, 12.0)
+        other_duration = RoomCondition("TRADING", "O_GOLD", 3, 3, 8.0)
+        vector = self.room_encoder.embedding(base)
+        self.assertEqual(len(vector), self.room_encoder.room_dim)
+        self.assertEqual(vector, self.room_encoder.embedding(base))
+        self.assertNotEqual(vector, self.room_encoder.embedding(higher_level))
+        self.assertNotEqual(vector, self.room_encoder.embedding(other_room))
+        self.assertNotEqual(vector, self.room_encoder.embedding(other_duration))
+        self.assertTrue(all(math.isfinite(value) for value in vector))
+        # 结构边必须真的参与：TRADING 的房间嵌入要能被「发电站/中枢」这一项区分出来。
+        self.assertGreater(abs(sum(vector[: len(ROOM_FEATURE_NAMES)])), 0.0)
+
+    def test_shared_model_prefers_a_different_operator_per_room(self) -> None:
+        model = self._two_room_oracle_model()
+        self.assertIsNotNone(model)
+        assert model is not None
+        trading_scores = model.affinity_scores(
+            RoomCondition("TRADING", "O_GOLD", 1, 1, 12.0), self.trading_names, self.embeddings
+        )
+        manufacture_scores = model.affinity_scores(
+            RoomCondition("MANUFACTURE", "F_GOLD", 1, 1, 12.0),
+            self.manufacture_names,
+            self.embeddings,
+        )
+        trading_best = max(trading_scores, key=lambda name: trading_scores[name])
+        manufacture_best = max(manufacture_scores, key=lambda name: manufacture_scores[name])
+        expected_trading = max(
+            self.trading_names, key=lambda name: self.embeddings[name][0]
+        )
+        expected_manufacture = max(
+            self.manufacture_names, key=lambda name: self.embeddings[name][1]
+        )
+        # 同一张表、同一批干员嵌入，只因为房间不同就给出不同的第一名。
+        self.assertEqual(trading_best, expected_trading)
+        self.assertEqual(manufacture_best, expected_manufacture)
+
+    def test_affinity_view_matches_the_materialised_linear_form(self) -> None:
+        model = self._two_room_oracle_model()
+        self.assertIsNotNone(model)
+        assert model is not None
+        condition = RoomCondition("TRADING", "O_GOLD", 3, 3, 12.0)
+        view = model.view(condition)
+        self.assertEqual(view.query.room_type, "TRADING")
+        self.assertEqual(len(view.unary), model.embedding_dim + view.bond_unary_width)
+        name = self.trading_names[0]
+        vector = self.embeddings[name]
+        direct = view.bias + sum(
+            weight * value for weight, value in zip(view.unary[: model.embedding_dim], vector)
+        )
+        self.assertAlmostEqual(view.score([name], self.embeddings), direct, places=9)
+        # 亲和度（一元项）与物化视图的一元项必须一致 —— 否则「同一张表」不成立。
+        affinity = model.affinity_scores(condition, [name], self.embeddings)[name]
+        self.assertAlmostEqual(direct - view.bias, affinity, places=9)
+        ranked = rank_combinations(
+            view, self.embeddings, self.trading_names, capacity=3, beam=6, top_k=3
+        )
+        self.assertEqual(len(ranked), 3)
+
+    def test_affinity_model_round_trips_through_dict(self) -> None:
+        model = self._two_room_oracle_model()
+        self.assertIsNotNone(model)
+        assert model is not None
+        restored = RoomAffinityModel.from_dict(
+            json.loads(json.dumps(model.to_dict())), self.room_encoder.room_graph
+        )
+        condition = RoomCondition("TRADING", "O_GOLD", 2, 1, 12.0)
+        self.assertAlmostEqual(
+            model.view(condition).bias, restored.view(condition).bias, places=9
+        )
+        self.assertEqual(
+            model.affinity_scores(condition, self.trading_names, self.embeddings),
+            restored.affinity_scores(condition, self.trading_names, self.embeddings),
+        )
+
+    def test_optimizer_affinity_readout_produces_conflict_free_schedule(self) -> None:
+        optimizer = GraphScheduleOptimizer(
+            self.game_data,
+            self.roster,
+            shard_formula="rock",
+            graph_config=GraphOptimizerConfig(
+                readout="affinity", use_cache=False, affinity_samples=32
+            ),
+        )
+        result = optimizer.optimize(
+            parse_layout("243"), mode="normal", shift_count=2, shift_hours=12, drone_policy="none"
+        )
+        self.assertEqual(find_conflicts(result), [])
+        self.assertGreater(result.score, 0.0)
+        stats = optimizer.graph_stats.get("affinityReadout") or {}
+        self.assertEqual(stats.get("readout"), "room_operator_affinity")
+        self.assertIn("roomGraph", optimizer.graph_stats)
+        # 物化视图必须真的走了共享表，而不是悄悄退回每间房各拟合一套。
+        spec = next(
+            room
+            for room in optimizer._room_specs(parse_layout("243"), "normal")
+            if room.room_type == "TRADING"
+        )
+        view = optimizer._ensure_room_model(spec, 12.0)
+        self.assertIsNotNone(view)
+        assert view is not None
+        self.assertNotIn("candidatePool", view.training)
+        matrix = optimizer.affinity_matrix(
+            [RoomCondition("TRADING", "O_GOLD", 3, 3, 12.0)] + [
+                RoomCondition("MANUFACTURE", "F_GOLD", 3, 3, 12.0)
+            ]
+        )
+        self.assertEqual(len(matrix), 2)
+        self.assertTrue(matrix[0])
+        self.assertNotEqual(matrix[0], matrix[1])
+
+    def test_affinity_model_reuses_the_disk_cache(self) -> None:
+        cache_dir = Path(self._temp.name) / "affinity_cache"
+        config = GraphOptimizerConfig(
+            readout="affinity", use_cache=True, cache_dir=str(cache_dir), affinity_samples=16
+        )
+        first = GraphScheduleOptimizer(
+            self.game_data, self.roster, shard_formula="rock", graph_config=config
+        )
+        model = first.affinity_model()
+        self.assertIsNotNone(model)
+        self.assertGreater(first._cache.writes, 0)
+
+        second = GraphScheduleOptimizer(
+            self.game_data, self.roster, shard_formula="rock", graph_config=config
+        )
+        restored = second.affinity_model()
+        self.assertIsNotNone(restored)
+        self.assertGreater(second._cache.hits, 0)
+        assert model is not None and restored is not None
+        condition = RoomCondition("TRADING", "O_GOLD", 3, 3, 12.0)
+        self.assertEqual(
+            model.unary_weights(condition), restored.unary_weights(condition)
+        )
+        self.assertEqual(
+            model.view(condition).pair[: model.embedding_dim],
+            restored.view(condition).pair[: restored.embedding_dim],
+        )
+
+    def test_affinity_readout_falls_back_to_per_room_without_numpy(self) -> None:
+        from unittest import mock
+
+        from arknights_schedule_generator import graph_conv
+
+        optimizer = GraphScheduleOptimizer(
+            self.game_data,
+            self.roster,
+            shard_formula="rock",
+            graph_config=GraphOptimizerConfig(readout="affinity", use_cache=False),
+        )
+        spec = next(
+            room
+            for room in optimizer._room_specs(parse_layout("243"), "normal")
+            if room.room_type == "TRADING"
+        )
+        with mock.patch.object(graph_conv, "_np", None):
+            self.assertFalse(optimizer.graph_config.uses_affinity_readout)
+            self.assertIsNone(optimizer.affinity_model())
+            model = optimizer._ensure_room_model(spec, 12.0)
+        self.assertIsNotNone(model)
+        assert model is not None
+        # 每间房各拟合一套的老路径才会带 candidatePool 训练信息。
+        self.assertIn("candidatePool", model.training)
 
 
 class BondBasisTest(unittest.TestCase):

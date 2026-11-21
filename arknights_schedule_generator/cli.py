@@ -14,7 +14,7 @@ from .graph_benchmark import (
     run_benchmark,
     write_benchmark_report,
 )
-from .graph_features import build_operator_graph
+from .graph_features import build_operator_graph, build_room_graph
 from .graph_optimizer import GraphOptimizerConfig
 from .optimizer import apply_layout_variant, parse_layout
 from .power import RIGHT_SIDE_PRESETS, apply_right_side_preset
@@ -384,6 +384,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the graph optimizer insertion group budget (default 24).",
     )
+    benchmark_parser.add_argument(
+        "--graph-readout",
+        default=None,
+        choices=("per_room", "affinity"),
+        help=(
+            "Graph readout form: 'per_room' (one model per room spec) or 'affinity' "
+            "(shared room-node x operator affinity matrix, M3b)."
+        ),
+    )
+    benchmark_parser.add_argument(
+        "--affinity-samples",
+        type=int,
+        default=None,
+        help="Override the shared affinity readout sample budget per room spec (default 256).",
+    )
+    benchmark_parser.add_argument(
+        "--affinity-ridge",
+        type=float,
+        default=None,
+        help="Override the shared affinity readout ridge penalty (default 4.0).",
+    )
     benchmark_parser.add_argument("--output-dir", default="outputs/benchmark")
     return parser
 
@@ -394,6 +415,8 @@ def graph_audit(args: argparse.Namespace) -> int:
     roster = load_roster_xlsx(Path(args.roster))
     graph = build_operator_graph(game_data, roster)
     report = graph.audit_report(limit=args.limit)
+    room_graph = build_room_graph(game_data)
+    report["roomGraph"] = room_graph.audit_report()
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -413,6 +436,16 @@ def graph_audit(args: argparse.Namespace) -> int:
         f"特殊心情节点（恢复自给自足，如 自律）: {report['specialMoraleNodeCount']}"
         + (f" -> {', '.join(report['specialMoraleNodes'])}" if report["specialMoraleNodes"] else "")
     )
+    room_report = report["roomGraph"]
+    print(
+        f"房间节点（M3b）: {room_report['nodeCount']}，边 "
+        f"{json.dumps(room_report['edgeCountByRelation'], ensure_ascii=False)}"
+    )
+    for room in room_report["rooms"]:
+        print(
+            f"- {room['room']:22s} 工位 {room['capacity']:.0f} "
+            f"每工位耗电 {room['powerPerSlot']:+.1f}"
+        )
     return 0
 
 
@@ -425,6 +458,12 @@ def benchmark(args: argparse.Namespace) -> int:
         config_kwargs["shortlist"] = args.shortlist
     if args.insertion_budget:
         config_kwargs["insertion_group_budget"] = args.insertion_budget
+    if args.graph_readout:
+        config_kwargs["readout"] = args.graph_readout
+    if args.affinity_samples:
+        config_kwargs["affinity_samples"] = args.affinity_samples
+    if args.affinity_ridge:
+        config_kwargs["affinity_ridge"] = args.affinity_ridge
     report = run_benchmark(
         game_data,
         roster,

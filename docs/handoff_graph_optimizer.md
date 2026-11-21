@@ -4,16 +4,18 @@
 > 最后更新：第 1、2、4 步 + 单体宿舍恢复 + 菲亚梅塔（自律节点 + 患难之交重置）+ 252/342 基准
 > + **M1（宿舍做成一等分配目标）都已完成**；不搓玉差距已定位到「逐房吃人」。
 > **第 7 步（修 O_DIAMOND 校准）也已完成**，并顺带修了两个被它暴露出来的结构性缺陷
-> （错峰周期阶跃成本、短名单填不满房间）。M3 的三条便宜路线都已实测排除，
-> **下一个窗口直接做 M3b（房间节点 + 亲和度矩阵）**；之后是第 5 步（办公室选人）、
-> 第 3 步（轮转表）、§6 第 9 条（跨房间联合分配，若还要碰 UI/班次结构）。
+> （错峰周期阶跃成本、短名单填不满房间）。M3 的三条便宜路线都已实测排除。
+> **M3b（房间节点 + 亲和度矩阵）也做完了**：读数质量确实更好（36 个规格里 30 个更好），
+> 但**端到端 3 胜 2 负 3 平**（两次退步都很大），默认仍是 `per_room`，`affinity` 作为可选项保留。
+> 剩下的活按优先级：**第 5 步（办公室选人）→ 第 3 步（轮转表）→ §6 第 9 条（跨房间联合分配）**。
 >
-> **2026-11 追加：M3a 已核查为 no-op**（短名单本来就是全部精确打分 + 精确排序；放宽候选条数
-> 与 beam 宽度实测分数一格不动）。**M3c 也试过一版并被候选池结构挡住**：一次全局 beam
-> 只能拿到「无排除」短名单，而短名单的池子上限 32 人、第 0 班就占了 29 席，第 1 班直接死路
-> （§3 第 6 步 M3c）。**覆盖修复也试过：不成立** —— 覆盖缺口是真的，但把提名覆盖补到理论
-> 最大反而让 243 不搓玉掉 4.68 分（§3 第 7 步之后的「两条便宜路线」）。
-> **下个窗口直接从 M3b 开始**（房间节点 + 亲和度矩阵）。
+> **2026-11 追加（M3 系列已全部有结论，别再重做）**：
+> - **M3a 是 no-op**（短名单本来就是全部精确打分 + 精确排序；放宽候选条数与 beam 宽度实测分数一格不动）。
+> - **M3c（一次全局 beam）是结构死路**（短名单的候选池上限 32 人、第 0 班占 29 席）。
+> - **覆盖修复不成立**（把提名覆盖补到理论最大反而让 243 不搓玉掉 4.68 分）。
+> - **M3b 做完了但没换来分数**：见 §3 第 6 步 M3b 与 `docs/graph_optimizer.md` §2.8。
+>   「读数层局部精度不是瓶颈」这条现在有三个独立证据（拟合样本 288→1536 掉 4%、
+>   覆盖补满掉 4.68、M3b 读数更准但排班更差）。
 
 ---
 
@@ -55,6 +57,15 @@
   但 beam 按预测分逐房吃人**（342 不搓玉的 `trading_2` 选到自己短名单**第 56 名**）。
   **校准 v2 之后「不搓玉稳输」不再成立**：342 不搓玉 −3.09% → **+0.17%**（§5）。
 - 安全备份分支：`backup/pre-rebase-graph`（rebase 前的原始状态）。
+- **M3b（房间节点 + 亲和度矩阵）已做完，默认关闭**：`graph_features` 新增房间节点图
+  （10 个「房型 × 产物」原型 + 发电站/中枢结构边，`graph-audit` 可见），`graph_conv` 新增
+  `RoomEncoder` / `RoomAffinityModel`（一条共享的双线性读出层，36 个规格池化拟合），
+  `GraphOptimizerConfig(readout="affinity")` 切换。**读数质量更好（36 个规格里 30 个更好，
+  TRADING/O_DIAMOND L3 12h R² 0.646 → 0.848、MAE 13.25 → 5.94），但端到端 3 胜 2 负 3 平**
+  （333 平衡搓玉 3×8 +1.10%、342 不搓玉 +3.36%、342 平衡搓玉 +0.56%；
+  333 极限搓玉 2×12 −27.3%、252 平衡搓玉 −12.9%）。
+  两次退步的机制是「全局决策被挪到更差的盆地」（源石碎片收支刀口、目标组合），不是逐房分数变差。
+  默认保持 `per_room`；细节与实测表见 §3 第 6 步 M3b、`docs/graph_optimizer.md` §2.8。
 - 测试：**276 passed / 1 skipped / 1 failed**（新增 O_DIAMOND 3 个、错峰修复 4 个、
   短名单兜底 1 个；删掉旧的 guide 查表用例 1 个）。唯一失败是既有环境问题
   （`test_calibration_report_examples_pass` 需要仓库外的 `C:\tmp\yituliu_schedule_images_current.js`，
@@ -71,14 +82,14 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `graph_features.py` | 静态干员图：阵营超节点 + 点名羁绊边 + 组合机制边；`graph-audit` CLI |
+| `graph_features.py` | 静态干员图：阵营超节点 + 点名羁绊边 + 组合机制边；**M3b 房间节点图**（`build_room_graph` / `RoomNode` / `StaticRoomGraph`，发电站→房间、中枢→房间）；`graph-audit` CLI |
 | `graph_bonds.py` | 显式羁绊基（阵营人数 / 点名羁绊指示函数），按「房间 × 产物」门控 |
-| `graph_conv.py` | 固定超参图卷积（确定性稀疏投影）+ 闭式岭回归读出层；numpy 可选加速 |
+| `graph_conv.py` | 固定超参图卷积（确定性稀疏投影）+ 闭式岭回归读出层；**M3b 共享亲和度读出层**（`RoomEncoder` / `RoomAffinityModel` / `fit_room_affinity_model`）；numpy 可选加速 |
 | `graph_cache.py` | 读出层 / 机制超边的磁盘缓存（`outputs/graph_model_cache/`） |
-| `graph_optimizer.py` | `GraphScheduleOptimizer(ScheduleOptimizer)`，同一契约 |
+| `graph_optimizer.py` | `GraphScheduleOptimizer(ScheduleOptimizer)`，同一契约；`GraphOptimizerConfig.readout` 选 `per_room` / `affinity` |
 | `graph_benchmark.py` | `benchmark` CLI：新旧对照，异常容错 |
 | `morale.py` | **上游**的心情周期审计（本次未改，见 §3） |
-| `docs/graph_optimizer.md` | 设计 + 实测（含 §3 打分模型、§5b 排班语义现状） |
+| `docs/graph_optimizer.md` | 设计 + 实测（含 §3 打分模型、§5b 排班语义现状、**§2.8 M3b**） |
 
 关键命令：
 
@@ -509,10 +520,64 @@ M2（可选，先别做）：读出层加「宿舍恢复」一元项并重新标
      「同班已用」的冲突组合。也就是说：**不是候选不够、也不是 beam 剪枝，而是前一个房间
      已经把后面房间需要的干员拿走了** —— 这正是 M3c 要解决的「跨房间/跨班次一起决定」。
    结论：**M3a 视为已满足（no-op），不要再做**；下一步直接上 M3c。
-2. **M3b 房间节点 + 亲和度矩阵**
-   `graph_features` 增加房间节点（房型/目标/等级/工位 + 与发电站、控制中枢的边）；
-   读出层的输入从「组合特征」改成「room 节点 embedding × operator 节点 embedding」的点积/注意力，
+2. **M3b 房间节点 + 亲和度矩阵 —— 已完成（2026-11）：读数更准，但排班分数更差**
+   原计划：`graph_features` 增加房间节点（房型/目标/等级/工位 + 与发电站、控制中枢的边）；
+   读出层的输入从「组合特征」改成「room 节点 embedding × operator 节点 embedding」的双线性形式，
    标签仍是 `ProductionSimulator` 的精确分。这样同一张表可以给任意房间-干员对打分。
+
+   **做到了什么**（`docs/graph_optimizer.md` §2.8 有完整设计）：
+   - `graph_features.build_room_graph`：10 个「房型 × 产物」原型节点 + 静态特征 16 维
+     （房型/产物 one-hot、三级 `maxStationedNum`、三级 `electricity`/工位、`isPowerRoom`、
+     `isResourceRoom`）+ 两条结构边（`POWER→耗电房` 权重 = 每工位耗电、`CONTROL→所有房间`）。
+     等级/工位/时长是**查询尾巴**，所以节点目录与布局无关、拟合结果跨布局复用。
+   - `graph_conv.RoomEncoder`：与干员侧同一套固定超参规则；邻居是原型、消息传递项可预计算，
+     房间嵌入 22 + 8 = 30 维。
+   - `graph_conv.RoomAffinityModel`：共享双线性读出层
+     `ŷ = b·r + Σ(A r)·e_i + Σ w_p·(e_i⊙e_j) + Σ(C r)·extra`，`A`（47×30）就是亲和度矩阵。
+     36 个规格池化拟合（6 房型/产物 × 3 等级 × 2 时长 × 256 样本 ≈ 6.4k 行 × 1607 列），
+     一次闭式岭回归，正规方程分块累积。
+   - `GraphOptimizerConfig(readout="affinity")` / `--graph-readout affinity`；无 numpy 自动退回。
+   - 新增能力 `GraphScheduleOptimizer.affinity_matrix(conditions, names)`：一条表给任意
+     「房间 × 干员」对打分（M3c 想要的底座）。
+
+   **读数质量确实更好**（`tools/probe_affinity_readout.py`，`outputs/m3b_readout_quality.txt`）：
+   36 个规格里 **30 个 R² 更好**。代表格子：
+
+   | 规格 | 每房一套 R² / MAE | 亲和度 R² / MAE |
+   | --- | --- | --- |
+   | TRADING/O_DIAMOND L3 12h | 0.646 / 13.25 | **0.848 / 5.94** |
+   | MANUFACTURE/F_GOLD L3 12h | 0.634 / 5.95 | **0.987 / 1.30** |
+   | MANUFACTURE/F_EXP L3 12h | 0.584 / 2.53 | **0.854 / 1.45** |
+   | TRADING/O_GOLD **L3 12h** | **0.801 / 2.25** | 0.262 / 2.42 |
+
+   **但端到端不换分**（同口径 `benchmark`，`outputs/benchmark_m3b_final_*`）：
+
+   | 场景 | per_room | affinity | 变化 |
+   | --- | --- | --- | --- |
+   | 243 不搓玉 2×12 | 603.177 | 603.177 | ±0.00% |
+   | 243 平衡搓玉 2×12 | 402.525 | 402.468 | −0.01% |
+   | 333 平衡搓玉 3×8 auto | 492.625 | **498.028** | **+1.10%** |
+   | 333 极限搓玉 2×12 auto | 485.711 | 353.033 | **−27.32%**（512 样本 469.5，−3.3%） |
+   | 252 不搓玉 2×12 | 644.897 | 644.897 | ±0.00% |
+   | 252 平衡搓玉 2×12 | 435.225 | 378.941 | **−12.93%** |
+   | 342 不搓玉 2×12 | 659.705 | **681.893** | **+3.36%** |
+   | 342 平衡搓玉 2×12 | 580.903 | **584.137** | **+0.56%** |
+
+   3 胜 2 负 3 平（平均分数比 0.956，被两次退步吃掉）。**这里顺带纠正 §5 的一个历史数字**：
+   §5 把「342 不搓玉 681.893」记在 per_room 名下，但 HEAD（本轮之前）冷/暖缓存复现都是
+   **659.705**（用 `git worktree` 在 d4dea16 上验过），681.893 只有 affinity 能拿到。
+
+   两次实质退步都**不是**「逐房分数变差」，而是**全局决策被挪到更差的盆地**：
+   - 333 极限搓玉：一个合成玉房 237.6 → 231.6，源石碎片日差 −0.12 → **+8.79（过剩）**，
+     `shardBalance` 一项 −104 分（再把重复次数规则推到 3 次循环）。样本提到 512 就回到 −3.3%，
+     说明是**刀口**；
+   - 252 平衡搓玉：目标组合从「2 经验 + 2 龙门币」变成「1 经验 + 3 龙门币」，
+     `exp` 109.76 → 53.68（−56 分）。对样本/采样方案**不敏感**（256 与 512 都是 378.941），
+     是目标选择层面的稳定偏移。
+
+   **结论**：`readout` 默认保持 `per_room`，`affinity` 作为可选项 + 后续跨房间定价的底座保留。
+   这条同时是「读数层局部精度不是瓶颈」的第三个独立证据（前两个：拟合样本 288→1536 掉 4%、
+   覆盖补满掉 4.68）。**不要再靠"把模型练得更准"去追分数**。
 3. **M3c 全局匹配解码 —— 试过一版，被候选池结构挡住（2026-11，实测记录）**
    目标：把「班次 × 房间」排成一个序列做**一次 beam**，让所有班次一起竞争同一批干员，
    冲突（同班重复 + 相邻班次重复）在状态里过滤，而不是「第 0 班先挑、后面的班次只能吃剩的」。
@@ -729,6 +794,12 @@ outputs/hardship_impact.md         四个基准场景是否触发患难之交（
 outputs/scan_orundum_v2.json       第 7 步之后的 16 组扫描明细
 outputs/benchmark_orundumv2/       4 场景基准（校准 v2）
 outputs/benchmark_252_342_orundumv2/  252/342 基准（校准 v2）
+outputs/benchmark_m3b_final_per_room/  M3b 验收：默认读出层（4 场景，含混合对照）
+outputs/benchmark_m3b_final_affinity/  M3b 验收：共享亲和度读出层（4 场景）
+outputs/benchmark_m3b_final_252_342_per_room/  252/342 同上（默认）
+outputs/benchmark_m3b_final_252_342_affinity/  252/342 同上（亲和度）
+outputs/m3b_readout_quality.txt     M3b 读数质量表（36 个规格逐格 R²/MAE）
+outputs/graph_audit_m3b.json        含房间节点图的静态图体检
 ```
 
 ```powershell
@@ -737,12 +808,25 @@ python tools/scan_m1_dormitory.py --output outputs/scan_orundum_v2.json
 
 # 校准 v2 的锚点与梯度（改 O_DIAMOND 口径必跑）
 python tools/measure_orundum_anchor.py
+
+# M3b：共享亲和度读出层的读数质量（每房一套 vs 亲和度）
+python tools/probe_affinity_readout.py --samples 256
+
+# M3b：同一场景在两种读出层下的逐房间差异（找掉分点）
+python tools/diff_m3b_readouts.py --layout 252 --mode balanced-orundum --drone-policy none
+
+# M3b：两种读出层的 4 场景基准
+python -m arknights_schedule_generator benchmark --roster .\examples\fixtures\yituliu_full_roster_maxed.xlsx `
+  --data-dir .\data\cache --graph-readout affinity --output-dir .\outputs\benchmark_m3b_final_affinity
 ```
 
 同目录还有：`tools/time_one_case.py`（单场景墙钟）、`tools/inspect_one_case.py`（审计摘要 +
 宿舍分配）、`tools/inspect_worst_balance.py`（最差收支的干员与其休息/在岗班次）、
 `tools/check_generate_outputs.py`（检查 `generate` 导出的 `cycleHours` / 门槛）、
-`tools/measure_orundum_anchor.py`（O_DIAMOND 锚点 + 梯度 + 组合分布）。
+`tools/measure_orundum_anchor.py`（O_DIAMOND 锚点 + 梯度 + 组合分布）、
+`tools/probe_affinity_readout.py`（M3b 读数质量）、`tools/diff_m3b_readouts.py`（M3b 逐房间差分）、
+`tools/probe_affinity_cost.py`（`_score_room_combo` 的单次成本：实测 0.01~0.02 ms，
+所以池化拟合的标签成本可以忽略，瓶颈在设计矩阵与正规方程）。
 调试用的临时脚本本轮都删了（`debug_boundary_relocation.py` / `debug_underfilled_room.py` /
 `probe_orundum_speeds.py`），需要时按 §3 第 7 步的描述重建。
 
@@ -943,6 +1027,16 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
 - **跨班次联合解码会同时抬高两列**：`_build_shifts` 是父类方法，混合与图卷积共用同一条
   逐班次解码，只有 `_room_combos` 不同。所以它不会自动缩小两者的差距；
   能缩小差距的只有「短名单在排除集下的覆盖」与「图特有的提名能力（M3b）」。
+- **「把读出层练得更准」不要再当作提分手段**（M3b，2026-11）：共享亲和度矩阵把 36 个规格
+  里 30 个的 holdout R² 都提高了（TRADING/O_DIAMOND L3 12h 0.646 → 0.848、MAE 13.25 → 5.94），
+  端到端却是 **3 胜 2 负 3 平**，其中 333 极限搓玉 −27.3%、252 平衡搓玉 −12.9%。
+  机制是**全局决策的刀口**：一个房间差 6 分就能让源石碎片收支从 −0.12 变成 +8.79（−104 分），
+  或者把目标组合从「2 经验 + 2 龙门币」换成「1 经验 + 3 龙门币」（−56 分）。
+  叠加已有的两条（拟合样本 288→1536 掉 4%、覆盖补满掉 4.68），
+  **局部读数精度不是瓶颈，跨房间/跨班次的全局决策才是**。详见 §3 第 6 步 M3b。
+- **`affinity` 读出层的缓存键必须含采样方案**：`AFFINITY_READOUT_VERSION` 与
+  `"sampling": "half_full_combo"` 都在键里。改了 `_sample_affinity_combos` 却忘了改版本，
+  基准会**静默复用旧模型**报出一模一样的数字（本轮踩过一次：采样方案改了以后四格分数一位没变）。
 
 ---
 
@@ -1010,6 +1104,17 @@ top16 召回 1.0。**M1 之后重跑同样逐位相同**（`outputs/benchmark_25
   分数一格不动、只会更慢。证据与实测数字见 §3 第 6 步 M3a。**下一步是 M3c**
   （跨房间/跨班次联合解码）——「逐房吃人」的真正机制是前一个房间拿走了后面房间要的人，
   不是候选顺序。
+- **M3b 已做完，别再当"待做项"**：房间节点图 + 共享亲和度矩阵都已实现（`readout="affinity"`），
+  读数更准但不换分（3 胜 2 负 3 平，两次退步都很大），默认 `per_room`。要接着用它，正确的方向是
+  `affinity_matrix()` 提供的**跨房间定价**（谁被别的房间更需要 → 一元分里的机会成本），
+  而不是继续调样本数/岭系数。细节见 §3 第 6 步 M3b。
+- **`affinity` 的缓存键必须跟着采样方案走**：改 `_sample_affinity_combos` 时要 +1
+  `AFFINITY_READOUT_VERSION`，否则基准会静默复用旧模型（本轮踩过：改完采样四格分数一位没变）。
+  `per_room` 与 `affinity` 的模型缓存是**不同的 kind**，互不干扰，所以切读出层不会让另一列重拟合。
+- **房间节点的等级/工位/时长必须留在"查询尾巴"里**：把它们塞进节点特征会让房间节点目录依赖布局，
+  换 layout 就换图指纹 → 拟合结果全失效（而且同一张表就没法给任意房间打分）。
+  反过来，`ROOM_CATALOG` 之外的房间规格（例如未来新增产物）要**显式退回** `per_room`，
+  不要让它用全零的房间向量去查表。
 - **O_DIAMOND 的校准常数只有一处**：`production.ORUNDUM_ORDER_THROUGHPUT_SCALE`（当前 1.0，
   由 `ORUNDUM_REFERENCE_*` 反解）。改锚点要同时改「参照常量 + 测试 +
   `tools/measure_orundum_anchor.py` + §5 两张表」。也**不要**去恢复 `guide_orundum_trade_lookup`

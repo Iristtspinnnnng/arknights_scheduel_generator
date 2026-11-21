@@ -36,11 +36,19 @@ __all__ = [
     "TARGETS",
     "RELATIONS",
     "FEATURE_NAMES",
+    "ROOM_CATALOG",
+    "ROOM_FEATURE_NAMES",
+    "ROOM_RELATIONS",
     "OperatorNode",
     "GraphEdge",
+    "RoomNode",
+    "RoomEdge",
     "StaticOperatorGraph",
+    "StaticRoomGraph",
     "build_operator_graph",
+    "build_room_graph",
     "graph_signature",
+    "room_graph_signature",
 ]
 
 # 参与优化的工作房间类型（宿舍单独处理：只影响心情，不影响产能）。
@@ -118,6 +126,163 @@ FEATURE_NAMES: tuple[str, ...] = (
     "combo_marker",
     "guide_anchor",
 )
+
+
+#: M3b 的房间节点目录：哪些「房型 × 产物」组合真的是一间可选房间。
+#:
+#: 顺序就是房间节点的稳定下标，也是 ``graph-audit`` 的打印顺序。
+#: 这里只放**静态**组合（不含等级/工位/时长）——等级与时长是**查询**属性，
+#: 由 ``graph_conv.RoomCondition`` 附在房间嵌入的尾巴上。这样房间节点目录与基建
+#: 布局无关，构建一次即可复用，不会因为换了 layout 就让整张图的指纹变化。
+ROOM_CATALOG: tuple[tuple[str, str | None], ...] = (
+    ("CONTROL", None),
+    ("TRADING", "O_GOLD"),
+    ("TRADING", "O_DIAMOND"),
+    ("MANUFACTURE", "F_GOLD"),
+    ("MANUFACTURE", "F_EXP"),
+    ("MANUFACTURE", "F_DIAMOND"),
+    ("POWER", None),
+    ("MEETING", None),
+    ("HIRE", None),
+    ("DORMITORY", None),
+)
+
+#: 房间节点的静态特征（与 :data:`ROOM_CATALOG` 一一对应，不含查询尾巴）。
+#:
+#: 和干员节点一样，这里的每一项都来自 ``building_data.json``，没有硬编码数值。
+ROOM_FEATURE_NAMES: tuple[str, ...] = (
+    "room:CONTROL",
+    "room:TRADING",
+    "room:MANUFACTURE",
+    "room:POWER",
+    "room:MEETING",
+    "room:HIRE",
+    "room:DORMITORY",
+    "target:O_GOLD",
+    "target:O_DIAMOND",
+    "target:F_GOLD",
+    "target:F_EXP",
+    "target:F_DIAMOND",
+    "capacity",
+    "powerPerSlot",
+    "isPowerRoom",
+    "isResourceRoom",
+)
+
+#: 房间节点之间的关系类型：发电站供电、控制中枢加成。
+ROOM_RELATIONS: tuple[str, ...] = ("power", "control")
+
+
+@dataclass(frozen=True)
+class RoomNode:
+    """图上的一个房间节点（房型 + 产物）。``features`` 与 :data:`ROOM_FEATURE_NAMES` 对齐。"""
+
+    room_type: str
+    target: str | None
+    features: tuple[float, ...]
+
+    @property
+    def key(self) -> tuple[str, str | None]:
+        return (self.room_type, self.target)
+
+    @property
+    def label(self) -> str:
+        return self.room_type if self.target is None else f"{self.room_type}/{self.target}"
+
+
+@dataclass(frozen=True)
+class RoomEdge:
+    """房间节点之间的关系边（无向语义，双向存储）。"""
+
+    src: int
+    dst: int
+    relation: str
+    weight: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "src": self.src,
+            "dst": self.dst,
+            "relation": self.relation,
+            "weight": round(self.weight, 6),
+        }
+
+
+@dataclass
+class StaticRoomGraph:
+    """房间节点图（M3b）。
+
+    它**不依赖基建布局**：节点目录是 :data:`ROOM_CATALOG`，特征是 ``building_data``
+    的房型常量（最大工位、每工位耗电）。等级 / 工位 / 时长在查询时拼到房间嵌入的
+    尾巴上（``graph_conv.RoomCondition``），所以同一张表可以给任意「房间 × 干员」对打分。
+    """
+
+    nodes: list[RoomNode]
+    edges: list[RoomEdge]
+    index_by_key: dict[tuple[str, str | None], int]
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def size(self) -> int:
+        return len(self.nodes)
+
+    def index(self, room_type: str, target: str | None) -> int | None:
+        return self.index_by_key.get((room_type, target))
+
+    def node(self, room_type: str, target: str | None) -> RoomNode | None:
+        idx = self.index_by_key.get((room_type, target))
+        return None if idx is None else self.nodes[idx]
+
+    def neighbours(self, room_type: str, target: str | None) -> list[tuple[RoomNode, str, float]]:
+        """该房间节点的**入边**邻居（发电站 / 控制中枢），即消息传递时聚合的对象。"""
+        idx = self.index_by_key.get((room_type, target))
+        if idx is None:
+            return []
+        return [
+            (self.nodes[edge.src], edge.relation, edge.weight)
+            for edge in self.edges
+            if edge.dst == idx
+        ]
+
+    def edge_count_by_relation(self) -> dict[str, int]:
+        counts = {relation: 0 for relation in ROOM_RELATIONS}
+        for edge in self.edges:
+            counts[edge.relation] = counts.get(edge.relation, 0) + 1
+        return counts
+
+    def audit_report(self) -> dict[str, Any]:
+        return {
+            "nodeCount": len(self.nodes),
+            "featureWidth": len(ROOM_FEATURE_NAMES),
+            "rooms": [
+                {
+                    "room": node.label,
+                    "capacity": round(node.features[ROOM_FEATURE_NAMES.index("capacity")] * 5.0, 3),
+                    "powerPerSlot": round(
+                        node.features[ROOM_FEATURE_NAMES.index("powerPerSlot")] * 60.0, 3
+                    ),
+                }
+                for node in self.nodes
+            ],
+            "edgeCountByRelation": self.edge_count_by_relation(),
+            "edges": [edge.as_dict() for edge in self.edges],
+            "signature": self.meta.get("signature"),
+            "dataVersion": self.meta.get("dataVersion"),
+        }
+
+    def to_dict(self, *, limit: int = 40) -> dict[str, Any]:
+        return {
+            "meta": self.meta,
+            "nodes": [
+                {
+                    "roomType": node.room_type,
+                    "target": node.target,
+                    "features": list(node.features),
+                }
+                for node in self.nodes[:limit]
+            ],
+            "edgeCount": len(self.edges),
+        }
 
 
 @dataclass(frozen=True)
@@ -302,6 +467,102 @@ def graph_signature(
     if meta:
         digest.update(json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))
     return digest.hexdigest()[:32]
+
+
+def room_graph_signature(
+    nodes: Sequence[RoomNode],
+    edges: Sequence[RoomEdge],
+    meta: Mapping[str, Any] | None = None,
+) -> str:
+    """房间图的稳定指纹（给共享亲和度矩阵做缓存键）。"""
+    digest = hashlib.sha256()
+    for name in ROOM_FEATURE_NAMES:
+        digest.update(name.encode("utf-8"))
+        digest.update(b",")
+    digest.update(b";")
+    for node in nodes:
+        digest.update(f"{node.room_type}|{node.target}|".encode("utf-8"))
+        digest.update(",".join(f"{value:.4f}" for value in node.features).encode("ascii"))
+        digest.update(b";")
+    for edge in edges:
+        digest.update(
+            f"{edge.relation}:{edge.src}->{edge.dst}:{edge.weight:.4f};".encode("utf-8")
+        )
+    if meta:
+        digest.update(json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8"))
+    return digest.hexdigest()[:32]
+
+
+def build_room_graph(game_data: GameData) -> StaticRoomGraph:
+    """从 ``building_data.json`` 构建房间节点图。
+
+    特征全部来自数据：
+
+    * ``capacity`` = 三级 ``maxStationedNum`` / 5；
+    * ``powerPerSlot`` = 三级 ``electricity`` / 工位 / 60（发电站为正、耗电房为负）；
+    * ``isPowerRoom`` / ``isResourceRoom`` 区分「供电」「产资源」「功能房」。
+
+    边只表达两件事：**发电站给它供电**（``power``，权重 = 每工位耗电）与
+    **控制中枢给它加成**（``control``，中枢的 ``basicCostBuff`` 对所有设施生效）。
+    这两条正是旧优化器里散落在 ``power.py`` / ``morale.py`` 的 if 判断。
+    """
+    rooms = game_data.building.get("rooms") or {}
+    control_buff = float((game_data.building.get("controlData") or {}).get("basicCostBuff") or 0)
+    nodes: list[RoomNode] = []
+    index_by_key: dict[tuple[str, str | None], int] = {}
+    for room_type, target in ROOM_CATALOG:
+        record = rooms.get(room_type) or {}
+        phases = record.get("phases") or []
+        top = phases[-1] if phases else {}
+        capacity = float(top.get("maxStationedNum") or 1)
+        electricity = float(top.get("electricity") or 0.0)
+        power_per_slot = electricity / max(1.0, capacity) / 60.0
+        features: list[float] = [0.0] * len(ROOM_FEATURE_NAMES)
+        index = {name: position for position, name in enumerate(ROOM_FEATURE_NAMES)}
+        room_feature = f"room:{room_type}"
+        if room_feature in index:
+            features[index[room_feature]] = 1.0
+        if target is not None and f"target:{target}" in index:
+            features[index[f"target:{target}"]] = 1.0
+        features[index["capacity"]] = capacity / 5.0
+        features[index["powerPerSlot"]] = power_per_slot
+        features[index["isPowerRoom"]] = 1.0 if room_type == "POWER" else 0.0
+        features[index["isResourceRoom"]] = (
+            1.0 if room_type in {"TRADING", "MANUFACTURE"} else 0.0
+        )
+        index_by_key[(room_type, target)] = len(nodes)
+        nodes.append(RoomNode(room_type, target, tuple(features)))
+
+    edges: list[RoomEdge] = []
+
+    def add_edge(src: int, dst: int, relation: str, weight: float) -> None:
+        if src == dst or weight <= 0:
+            return
+        edges.append(RoomEdge(src, dst, relation, float(weight)))
+
+    power_index = index_by_key.get(("POWER", None))
+    control_index = index_by_key.get(("CONTROL", None))
+    capacity_position = ROOM_FEATURE_NAMES.index("capacity")
+    power_position = ROOM_FEATURE_NAMES.index("powerPerSlot")
+    for node_index, node in enumerate(nodes):
+        if node.room_type == "POWER":
+            continue
+        draw = abs(node.features[power_position]) * max(0.2, node.features[capacity_position])
+        if power_index is not None and draw > 0:
+            add_edge(power_index, node_index, "power", draw)
+        if control_index is not None and control_buff < 0:
+            # 中枢减耗对所有在岗干员生效（`morale` 侧的基准规则），所以是「中枢 → 每个房间」。
+            add_edge(control_index, node_index, "control", 1.0)
+    meta: dict[str, Any] = {
+        "dataVersion": game_data.data_version,
+        "catalog": [f"{room}" + ("" if target is None else f"/{target}") for room, target in ROOM_CATALOG],
+        "featureNames": list(ROOM_FEATURE_NAMES),
+        "controlDataBasicCostBuff": control_buff,
+    }
+    meta["signature"] = room_graph_signature(nodes, edges, {"dataVersion": game_data.data_version})
+    return StaticRoomGraph(
+        nodes=nodes, edges=edges, index_by_key=index_by_key, meta=meta
+    )
 
 
 def build_operator_graph(
