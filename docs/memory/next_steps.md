@@ -1320,3 +1320,33 @@ Next step is M3c (rooms x operators joint assignment); M3b (room nodes + affinit
 enabler. Small plumbing kept from this audit: `_joint_production_room_assignments` now resolves its
 candidate limit through `joint_production_candidate_limit()`, so the audit fields and the recommender
 cache key share one source of truth.
+
+### P16 addendum 2 - coverage fix tried and rejected; next session starts at M3b
+
+After closing M3a (no-op) and M3c (structurally blocked), the third cheap plan was "fix the shortlist
+coverage under exclusion sets". Measured with `tools/probe_coverage_variants.py`, which compares both the
+name set and the skill-variant key:
+
+- 243 normal: 3 of 6 sampled rooms genuinely miss the exhaustive optimum (e.g. the 61.645
+  `能天使,但书,蕾缪安` trio is not nominated at all), plus 1 room where the name set is present with a
+  different variant.
+- 333 balanced-orundum: all 6 sampled rooms have the exhaustive optimum present, so that gap is
+  conflict/joint, not coverage.
+
+Fixing it by widening nomination does not help: with `GraphOptimizerConfig.beam` 18 -> 32 (which
+enumerates the whole 32-operator candidate pool, i.e. maximal coverage) 243 normal drops 603.177 ->
+598.497 and 342 normal 681.893 -> 681.203, while 333 is unchanged; `lexicographic_prefix` 96 -> 192 has no
+effect at all. Mechanism is the same as the documented "more samples is worse": the shortlist is the model's
+predicted top 64, so a wider nomination pool lets model-favoured combos displace the ones the downstream
+beam/insertion search would have exploited.
+
+So candidate-set completeness is not the bottleneck. All three cheap routes (M3a, M3c, coverage) are now
+measured and rejected. **Next session starts with M3b**: room nodes plus an affinity matrix, so one table
+scores any (room, operator) pair. M3b is the only untried route that changes both nomination quality and
+pairwise scoring, and it also naturally addresses the "same names, different variant" case found above.
+
+Open thread worth one instrumentation pass before anyone revisits coverage: the rooms where
+`names=False` are missing exactly the mechanism trios that `_mechanism_combos` is supposed to inject,
+which suggests either an assignment coming from the `used_names` fallback path (different exclusion set
+than the one captured) or an assembly miss in `_mechanism_combos` (`mechanism_partner_pool=12` + variant
+picking). Not needed for M3b.
