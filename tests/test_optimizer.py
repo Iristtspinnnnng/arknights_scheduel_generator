@@ -55,6 +55,51 @@ class OptimizerTest(unittest.TestCase):
             room_output_score(spec, lower_lmd_lower_gold_use),
         )
 
+    def test_room_output_score_uses_the_global_price_table(self) -> None:
+        """逐房目标必须是全局分数的线性化（2026-11 口径修订，handoff §9.4）。
+
+        以前赤金房逐房给 +8 分/赤金、全局给 0（`pureGoldDelta` 不进分项），
+        6 间生产房里 2 间的方向信号与实际评分完全无关（秩相关 0.00）。
+        """
+        from arknights_schedule_generator.production import (
+            GOLD_SCORE_PER_UNIT,
+            LMD_SCORE_PER_UNIT,
+            ORUNDUM_PER_SHARD,
+            ORUNDUM_SCORE_PER_UNIT,
+            SHARD_LMD_COST,
+        )
+
+        gold_spec = RoomSpec("manufacture_1", "MANUFACTURE", "F_GOLD", 3)
+        self.assertAlmostEqual(
+            room_output_score(gold_spec, ProductionVector(pureGoldDelta=10.0)),
+            GOLD_SCORE_PER_UNIT * 10.0,
+        )
+        # 赤金按它换出来的龙门币计价：500 龙门币/赤金 × 龙门币唯一价。
+        self.assertAlmostEqual(GOLD_SCORE_PER_UNIT, LMD_SCORE_PER_UNIT * 500.0, places=9)
+
+        orundum_spec = RoomSpec("trading_1", "TRADING", "O_DIAMOND", 3)
+        self.assertAlmostEqual(
+            room_output_score(orundum_spec, ProductionVector(orundum=100.0)),
+            ORUNDUM_SCORE_PER_UNIT * 100.0,
+        )
+
+        lmd_spec = RoomSpec("trading_2", "TRADING", "O_GOLD", 3)
+        self.assertAlmostEqual(
+            room_output_score(lmd_spec, ProductionVector(lmdGross=10000.0)),
+            LMD_SCORE_PER_UNIT * 10000.0,
+        )
+
+        shard_spec = RoomSpec("manufacture_2", "MANUFACTURE", "F_DIAMOND", 3)
+        net_per_shard = (
+            ORUNDUM_SCORE_PER_UNIT * ORUNDUM_PER_SHARD
+            - LMD_SCORE_PER_UNIT * SHARD_LMD_COST
+        )
+        self.assertGreater(net_per_shard, 0.0)
+        self.assertAlmostEqual(
+            room_output_score(shard_spec, ProductionVector(shardDelta=10.0)),
+            net_per_shard * 10.0,
+        )
+
     def test_target_selection_inventory_penalty_ignores_pure_gold_delta(self) -> None:
         balanced_gold = production_report_for_selection(
             20000.0,

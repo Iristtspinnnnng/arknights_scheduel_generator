@@ -16,9 +16,10 @@ from typing import Any
 
 __all__ = ["GraphModelCache", "CACHE_SCHEMA_VERSION", "DEFAULT_CACHE_DIR"]
 
-# 3：O_DIAMOND 校准 v2（速度参与、不裁剪订单上限）改变了这部分房间的产能标签，
-#    读出层必须重拟合；旧缓存里的模型与真实标签不再一致，靠版本号整体作废。
-CACHE_SCHEMA_VERSION = 3
+# 4：2026-11 价格口径修订（唯一价格表 + 碎片硬约束）改变了 room_output_score，
+#    也就是读出层的**标签**；旧缓存里的模型与真实标签不再一致，靠版本号整体作废。
+# 3：O_DIAMOND 校准 v2（速度参与、不裁剪订单上限）改变了这部分房间的产能标签。
+CACHE_SCHEMA_VERSION = 4
 DEFAULT_CACHE_DIR = Path("outputs") / "graph_model_cache"
 
 

@@ -61,6 +61,33 @@ DEFAULT_PURE_GOLD_TARGET_PER_DAY = -2.0
 DEFAULT_PURE_GOLD_TOLERANCE = 0.5
 DEFAULT_MAX_DRONE_CYCLE_REPEATS = 7
 
+# ---- 唯一价格表：所有「分」都从这里推出（2026-11 口径修订，handoff §9） --------
+#
+# 以前同一个「分」在三处用三套汇率：全局 `score_breakdown_for`、逐房
+# `room_output_score`、目标选择的罚项。结果最致命的一条是**玉的成本比它的计价还贵**：
+# 碎片配方 2 源岩 + 1600 龙门币 → 1 碎片 → 10 玉，即 1 玉 = 160 龙门币，
+# 而旧口径把龙门币按 7.5/1000 计（1 玉 = 133 龙门币）、搓玉模式下按 6.5/1000 计
+# （1 玉 = 154 龙门币），于是搓玉在评分器里天生亏本，最优解被迫落在「精确归零」的刀口上。
+#
+# 现在：龙门币只有一个价（收入=支出），玉按 200 龙门币/玉（对 160 的成本留 25% 溢价），
+# 碎片盈余视为库存（不再罚），碎片缺口由硬约束 `orundum ≤ 碎片 × 10` 兜住。
+
+#: 龙门币 → 分。**唯一**的龙门币价格，收入与支出同价。
+LMD_SCORE_PER_UNIT = 6.0 / 1000.0
+#: 玉 → 分。1 玉 = 1.2 分 ⇒ 200 龙门币/玉（碎片成本 160）。
+ORUNDUM_SCORE_PER_UNIT = 1.2
+#: 经验 → 分（与旧口径一致）。
+EXP_SCORE_PER_UNIT = 4.0 / 1000.0
+#: 赤金 → 龙门币。L3 龙门币订单 E[lmd]=1450、E[gold]=2.9 ⇒ 500 龙门币/赤金。
+GOLD_LMD_EQUIVALENT = 1450.0 / 2.9
+#: 赤金 → 分。**只给逐房目标用**：全局分里赤金不计价（见 score_breakdown_for 的说明），
+#: 所以这是「赤金换出来的龙门币」这个转换价值的代理，用来让赤金房有方向信号。
+GOLD_SCORE_PER_UNIT = LMD_SCORE_PER_UNIT * GOLD_LMD_EQUIVALENT
+#: 一片源石碎片的龙门币成本（`DEFAULT_FORMULAS["F_DIAMOND_ROCK"]` 的 4001 项）。
+SHARD_LMD_COST = 1600.0
+#: 一片碎片能搓出的玉。
+ORUNDUM_PER_SHARD = ORUNDUM_PER_SHARD_ORDER / SHARDS_PER_ORUNDUM_ORDER
+
 # ---- 社区口径的房型增益权重（以 1% 干员增益为单位，贸易站 = 1） ---------------
 #
 # 社区常用换算：1% 贸易站 = 1% 制造站，2% 发电站 = 1% 贸易站，
@@ -83,14 +110,14 @@ ROOM_EFFICIENCY_SCORED_ROOM_TYPES: tuple[str, ...] = ("POWER", "MEETING", "HIRE"
 #   L3 龙门币订单 E[lmd]=1450、E[秒]=12204
 #   ⇒ 每日 lmdGross ≈ 86400/12204 × 1450 = 10266 × 倍率
 #   ⇒ +1%（倍率 +0.01）= +102.66 LMD/天
-#   分数里 lmdGross 按 /1000 × 1.5 计 ⇒ 0.154 分
-# 这个数只从既有常量推导，不引入新的“魔法数字”。
+#   分数里龙门币按 LMD_SCORE_PER_UNIT 计 ⇒ 0.616 分
+# 这个数只从既有常量推导，不引入新的“魔法数字”；价格表改了它自动跟着改。
 TRADE_EQUIVALENT_PERCENT_SCORE = (
-    86400.0 / 12204.0 * 1450.0 * 0.01 * (1.5 / 1000.0)
+    86400.0 / 12204.0 * 1450.0 * 0.01 * LMD_SCORE_PER_UNIT
 )
-# 房间级选人目标用的同一锚点，但按 ``room_output_score`` 的贸易系数 0.0036 折算。
+# 房间级选人目标用的是**同一个**贸易等价锚点（2026-11 口径修订：以前是另一套 0.0036）。
 TRADE_EQUIVALENT_PERCENT_ROOM_SCORE = (
-    86400.0 / 12204.0 * 1450.0 * 0.01 * 0.0036
+    86400.0 / 12204.0 * 1450.0 * 0.01 * LMD_SCORE_PER_UNIT
 )
 
 GUIDE_LMD_TRADE_LOOKUPS = (
@@ -427,6 +454,11 @@ class ProductionVector:
     materialCosts: dict[str, float] = field(default_factory=dict)
     overflowLoss: float = 0.0
     fatigueRisk: float = 0.0
+    orundumIdle: float = 0.0
+    """因**源石碎片供给不足**而没搓出来的玉（诊断字段，不进 score）。
+
+    碎片是玉的硬约束（见 ``ORUNDUM_PER_SHARD``）：一个周期里能搓的玉不超过碎片供给 ×10。
+    被卡掉的这部分只记在这里，不额外扣分——因为 ``orundum`` 已经是裁剪后的值。"""
     droneContribution: dict[str, float] = field(default_factory=dict)
     droneCount: float = 0.0
     droneUsed: float = 0.0
@@ -453,6 +485,7 @@ class ProductionVector:
         self.shardDelta += other.shardDelta
         self.overflowLoss += other.overflowLoss
         self.fatigueRisk += other.fatigueRisk
+        self.orundumIdle += other.orundumIdle
         for item_id, count in other.materialCosts.items():
             self.materialCosts[item_id] = self.materialCosts.get(item_id, 0.0) + count
         for key, value in other.droneContribution.items():
@@ -481,6 +514,7 @@ class ProductionVector:
         self.shardDelta *= factor
         self.overflowLoss *= factor
         self.fatigueRisk *= factor
+        self.orundumIdle *= factor
         for item_id in list(self.materialCosts):
             self.materialCosts[item_id] *= factor
         for key in list(self.droneContribution):
@@ -500,6 +534,7 @@ class ProductionVector:
             "meetingSpeed": round(self.meetingSpeed, 3),
             "pureGoldDelta": round(self.pureGoldDelta, 3),
             "shardDelta": round(self.shardDelta, 3),
+            "orundumIdle": round(self.orundumIdle, 3),
             "materialCosts": {k: round(v, 3) for k, v in sorted(self.materialCosts.items())},
             "overflowLoss": round(self.overflowLoss, 3),
             "fatigueRisk": round(self.fatigueRisk, 3),
@@ -718,7 +753,9 @@ class ProductionSimulator:
         self.pure_gold_target = float(pure_gold_target)
         self.pure_gold_tolerance = max(0.0, float(pure_gold_tolerance))
 
-    def evaluate(self, shifts: list[ShiftPlan]) -> ProductionReport:
+    def evaluate(
+        self, shifts: list[ShiftPlan], *, allow_shard_draw: bool = False
+    ) -> ProductionReport:
         cycle = ProductionVector()
         room_reports: list[dict[str, Any]] = []
         unsupported: list[dict[str, str]] = []
@@ -764,6 +801,7 @@ class ProductionSimulator:
         drone_vector = self.evaluate_drones(shifts, daily)
         daily.add(drone_vector)
         daily.lmdNet = daily.lmdGross - daily.materialCosts.get("4001", 0.0)
+        self.apply_shard_supply_constraint(daily, allow_shard_draw=allow_shard_draw)
         score_breakdown = score_breakdown_for(daily)
         return ProductionReport(
             dailyExpected=daily,
@@ -776,6 +814,36 @@ class ProductionSimulator:
             sourceAssumptions=self.source_assumptions(),
             roomEfficiencyDetail=room_efficiency_detail(daily),
         )
+
+    def apply_shard_supply_constraint(
+        self, vector: ProductionVector, *, allow_shard_draw: bool = False
+    ) -> None:
+        """把「源石碎片供给」变成玉产量的**硬约束**（2026-11 口径修订，handoff §9）。
+
+        碎片是玉的唯一来源：``2 碎片 → 20 玉``，即 1 碎片 = 10 玉。所以在**一个周期**里
+        能搓出来的玉不可能超过 ``碎片供给 × 10``。旧口径把这条写成线性罚项
+        ``|shardDelta| × 12``，既罚缺口又罚盈余（盈余比碎片能换的玉还贵），
+        于是最优解只能落在「精确归零」的刀口上，抖动一次就是上百点（M3b 实测）。
+
+        现在的做法：
+
+        * ``供给 = shardDelta + orundum / 10``（净增 + 已消耗）；
+        * 供给不足时把 ``orundum`` 裁到 ``供给 × 10``，被裁掉的部分记进
+          ``orundumIdle``（诊断字段，不进分——玉已经少算了，不能重复扣）；
+        * 供给富余时 ``shardDelta`` 就是库存盈余，**不再罚**；
+        * ``allow_shard_draw=True`` 时不做裁剪（单房间校准 / 明确允许吃库存的场景）。
+
+        注意它只作用在**整条排班**（:meth:`evaluate`）上，不作用于
+        :meth:`evaluate_room`——逐房打分必须能回答「这间房自己值多少」，
+        否则玉房的短名单全是 0。"""
+        if allow_shard_draw:
+            return
+        supply_shards = vector.shardDelta + vector.orundum / ORUNDUM_PER_SHARD
+        sustainable = max(0.0, supply_shards) * ORUNDUM_PER_SHARD
+        if vector.orundum > sustainable + 1e-9:
+            vector.orundumIdle += vector.orundum - sustainable
+            vector.orundum = sustainable
+            vector.shardDelta = 0.0
 
     def evaluate_room(
         self,
@@ -2196,7 +2264,8 @@ def drone_policy_score(policy: str, vector: ProductionVector) -> float:
         return max(0.0, vector.shardDelta) * 20.0
     if policy == "exp-factory":
         return vector.exp
-    return score_breakdown_for(vector).get("lmdGross", 0.0)
+    # 兜底分支按同一张价格表把龙门币折成分（旧口径取的是已删除的 "lmdGross" 分项）。
+    return score_breakdown_for(vector).get("lmd", 0.0)
 
 
 def merge_drone_allocations(allocations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2277,11 +2346,23 @@ def resource_balance_penalty(
     lmd_net: float,
     orundum: float,
 ) -> float:
-    _ = pure_gold_delta
-    penalty = abs(shard_delta) * 12.0
-    if orundum > 0.001:
-        penalty += abs(lmd_net) / 1000.0 * 5.0
-    return penalty
+    """库存/收支的**额外**罚项。2026-11 口径修订后**恒为 0**（保留签名以兼容调用方）。
+
+    为什么归零：
+
+    * **碎片**：缺口已经由 :meth:`ProductionSimulator.evaluate` 的硬约束
+      ``orundum ≤ 碎片 × 10`` 兜住（缺口只会表现为 ``orundumIdle``，玉已经扣掉了），
+      盈余则是库存——它的龙门币成本已经通过 ``lmdNet`` 付过一次。
+      旧口径额外罚 ``|shardDelta| × 12``，比一片碎片能换的玉（10 分）还贵，
+      把最优解逼到「精确归零」的刀口上（handoff §9.2）。
+    * **龙门币**：``|lmdNet| × 5/1000`` 与全局分的 ``lmdGross × 1.5/1000``
+      叠加，会让「挣来的龙门币」比「花掉的龙门币」贵 30%，而且让玉的边际收益
+      在赤字/盈余两种状态下符号相反。现在龙门币只有一个价
+      （:data:`LMD_SCORE_PER_UNIT`，收入=支出），不需要第二套平衡罚项。
+    * **赤金**：全局分里本来就不计价（见 ``score_breakdown_for``）。
+    """
+    _ = (pure_gold_delta, shard_delta, lmd_net, orundum)
+    return 0.0
 
 
 def pure_gold_balance_error(
@@ -2723,18 +2804,32 @@ def room_efficiency_score(vector: ProductionVector) -> float:
 
 
 def score_breakdown_for(vector: ProductionVector) -> dict[str, float]:
-    lmd_net_score = 0.0 if vector.orundum > 0.001 else vector.lmdNet / 1000.0 * 6.0
+    """综合分 = 按**唯一价格表**折算的资源流 + 房型增益分。
+
+    2026-11 口径修订（handoff §9）：以前同一个「分」在三处用了三套汇率
+    （全局 ``score_breakdown_for``、逐房 ``room_output_score``、目标选择的罚项），
+    于是「1 玉值多少龙门币」在三处各不相同，最要命的是玉的**成本**比它的
+    **计价**还贵，导致搓玉在评分器里天生亏本、且最优解只能落在「精确归零」的刀口上。
+    现在所有分项都从 :data:`LMD_SCORE_PER_UNIT` / :data:`ORUNDUM_SCORE_PER_UNIT`
+    推出，改价格只改那两个常数。
+
+    * **龙门币只有一个价**（收入与支出同价）。旧的
+      ``lmdGross × 1.5/1000``（收入）+ ``lmdNet × 6/1000`` / ``−|lmdNet| × 5/1000``
+      三处叠加已经删除，所以"挣"和"花"不再有 30% 的价差。
+    * **玉 = 1.2 分**（≈ 200 龙门币/玉）。碎片配方是 1600 龙门币 → 10 玉
+      （= 160 龙门币/玉），留 25% 的效用溢价，搓玉才是正收益。
+    * **碎片不再罚盈余**：缺口由 :meth:`ProductionSimulator.evaluate` 里的
+      ``orundum ≤ 碎片 × 10`` 硬约束兜住，盈余就是库存（它的龙门币成本已经通过
+      ``lmdNet`` 付过，重复罚一次只会把最优解逼到刀口）。
+    * **赤金仍然不计价**（``pureGoldDelta`` 不进分项），
+      理由见 ``test_score_breakdown_does_not_penalize_pure_gold_inventory``。
+    """
     return {
-        "orundum": vector.orundum,
+        "orundum": ORUNDUM_SCORE_PER_UNIT * vector.orundum,
         "office": vector.officeSpeed / 30.0,
         "meeting": vector.meetingSpeed / 30.0,
-        "lmdGross": vector.lmdGross / 1000.0 * 1.5,
-        "lmdNet": lmd_net_score,
-        "exp": vector.exp / 1000.0 * 4.0,
-        "shardBalance": -abs(vector.shardDelta) * 12.0,
-        "lmdNetBalance": -abs(vector.lmdNet) / 1000.0 * 5.0
-        if vector.orundum > 0.001
-        else 0.0,
+        "lmd": LMD_SCORE_PER_UNIT * vector.lmdNet,
+        "exp": EXP_SCORE_PER_UNIT * vector.exp,
         "overflowPenalty": -vector.overflowLoss * 5.0,
         "fatiguePenalty": -vector.fatigueRisk * 2.0,
         # 社区口径的房型增益分（贸易=1 单位）：2% 发电 ≡ 1% 贸易、

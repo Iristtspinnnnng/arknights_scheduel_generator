@@ -77,7 +77,10 @@ PRESETS = {
         lmd_policy="lmd_net_balance_required",
         inventory_policy="prefer_near_zero_gold_shard_and_lmd_net_delta",
         drone_policy="reported_separately",
-        target_selection_penalties=("inventory_balance", "lmd_net_balance"),
+        # 2026-11 口径修订：`lmd_net_balance`（|lmdNet|/100）已删除——龙门币现在只有
+        # 一个价（收入=支出），再叠一个绝对值罚项会把最优解逼到刀口上；碎片也不再用
+        # 罚项，改为 `orundum <= 碎片 * 10` 硬约束。只剩 `inventory_balance`（现为 0）。
+        target_selection_penalties=("inventory_balance",),
     ),
     "max_orundum": ModePreset(
         id="max_orundum",
@@ -91,7 +94,7 @@ PRESETS = {
         lmd_policy="lmd_net_balance_penalized_not_primary",
         inventory_policy="prefer_stable_gold_shard_and_lmd_net_delta",
         drone_policy="reported_separately",
-        target_selection_penalties=("inventory_balance", "lmd_net_balance"),
+        target_selection_penalties=("inventory_balance",),
     ),
 }
 

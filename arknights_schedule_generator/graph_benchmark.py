@@ -80,7 +80,15 @@ DEFAULT_BENCHMARK_CASES: tuple[BenchmarkCase, ...] = (
     BenchmarkCase("333-max-2x12-auto", "333", "max-orundum", 2, 12, "auto"),
 )
 
-_DAILY_KEYS = ("lmdGross", "lmdNet", "exp", "orundum", "pureGoldDelta", "shardDelta")
+_DAILY_KEYS = (
+    "lmdGross",
+    "lmdNet",
+    "exp",
+    "orundum",
+    "orundumIdle",
+    "pureGoldDelta",
+    "shardDelta",
+)
 
 
 def run_benchmark(

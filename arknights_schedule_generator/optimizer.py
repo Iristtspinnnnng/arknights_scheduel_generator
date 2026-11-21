@@ -30,10 +30,16 @@ from .production import (
     DEFAULT_MAX_DRONE_CYCLE_REPEATS,
     DEFAULT_PURE_GOLD_TARGET_PER_DAY,
     DEFAULT_PURE_GOLD_TOLERANCE,
+    EXP_SCORE_PER_UNIT,
+    GOLD_SCORE_PER_UNIT,
     GUIDE_MANUFACTURE_LOOKUPS,
     GUIDE_SPECIAL_TRADE_ANCHORS,
+    LMD_SCORE_PER_UNIT,
+    ORUNDUM_PER_SHARD,
+    ORUNDUM_SCORE_PER_UNIT,
     ROOM_EFFICIENCY_SCORED_ROOM_TYPES,
     ROOM_EFFICIENCY_WEIGHTS,
+    SHARD_LMD_COST,
     TRADE_EQUIVALENT_PERCENT_ROOM_SCORE,
     ProductionReport,
     ProductionSimulator,
@@ -72,7 +78,9 @@ COMBO_CANDIDATE_TOP_LIMIT = 14
 COMBO_CANDIDATE_POOL_LIMIT = 32
 #: 23：O_DIAMOND 校准 v2（速度参与、不裁剪订单上限）→ 搓玉房间的产能分变了，
 #:     旧的 candidate 缓存必须作废，否则 ``recommend`` 会复用旧分数。
-OPTIMIZER_MODEL_VERSION = 23
+OPTIMIZER_MODEL_VERSION = 24
+# 24：2026-11 价格口径修订（唯一价格表 + 碎片硬约束 + 逐房目标线性化，见 handoff §9）。
+# 房间分与目标选择的排序都变了，候选缓存必须整体作废。
 LAYOUT_ROOM_COUNT_LIMITS = {
     "TRADING": 5,
     "MANUFACTURE": 5,
@@ -4410,17 +4418,39 @@ def synthetic_guide_manufacture_skill(operator: RosterOperator, target: str | No
 
 
 def room_output_score(spec: RoomSpec, vector: ProductionVector) -> float:
+    """房间级选人目标：**全局分数的线性化**（2026-11 口径修订，handoff §9.4）。
+
+    以前这里和 ``score_breakdown_for`` 是两套汇率，实测最刺眼的是赤金房：
+    逐房给 ``+8 分/赤金``，全局给 ``0``（`pureGoldDelta` 不进分项），
+    于是 6 间生产房里 2 间的方向信号是**完全无关**的（秩相关 0.00）。
+    现在每一项都从同一张价格表推出（``production.LMD_SCORE_PER_UNIT`` 等）：
+
+    * 贸易/龙门币：``p_LMD × lmdGross``（全局就是按同一个价计联的龙门币净额）
+    * 贸易/玉：``p_玉 × orundum``（玉房按毛收入计价，碎片成本在制造站侧扣）
+    * 制造/源石碎片：``(p_玉 × 10 − p_LMD × 1600) × 碎片`` = 净增值
+    * 制造/赤金：``p_LMD × 500 龙门币/赤金 × 赤金``（**转换价值**代理：全局分不直接给赤金计价，
+      但龙门币订单要消耗赤金，所以它的价值就是它换出来的龙门币）
+    * 制造/经验：``p_EXP × exp``（与全局完全一致）
+
+    有意保留的偏差：逐房分之和**大于**总分，因为中间品（赤金、碎片）按转换价值计在了
+    生产侧，而全局分只扣一次成本。逐房分只用来**排序候选与比较房间**，
+    最终裁决永远是模拟器给的全局分。
+    """
     score = -vector.overflowLoss * 5.0 - vector.fatigueRisk * 2.0
     if spec.room_type == "TRADING":
         if spec.target == "O_DIAMOND":
-            return score + vector.orundum
-        return score + vector.lmdGross * 0.0036
+            return score + ORUNDUM_SCORE_PER_UNIT * vector.orundum
+        return score + LMD_SCORE_PER_UNIT * vector.lmdGross
     if spec.room_type == "MANUFACTURE":
         if spec.target == "F_EXP":
-            return score + vector.exp / 1000.0 * 4.0
+            return score + EXP_SCORE_PER_UNIT * vector.exp
         if spec.target == "F_DIAMOND":
-            return score + vector.shardDelta * 12.0 - vector.materialCosts.get("4001", 0.0) / 1000.0 * 5.0
-        return score + vector.pureGoldDelta * 8.0
+            shards = vector.shardDelta
+            return score + shards * (
+                ORUNDUM_SCORE_PER_UNIT * ORUNDUM_PER_SHARD
+                - LMD_SCORE_PER_UNIT * SHARD_LMD_COST
+            )
+        return score + GOLD_SCORE_PER_UNIT * vector.pureGoldDelta
     if spec.room_type in ROOM_EFFICIENCY_SCORED_ROOM_TYPES:
         # 发电 / 会客 / 办公室没有资源流收益（发电的无人机只覆盖一小部分），
         # 按社区权重折算成贸易等价分，保证「2% 发电 = 12% 会客 = ... = 1% 贸易」。
@@ -4700,11 +4730,12 @@ def target_selection_score(
     contract = preset_contract(mode)
     penalties = set(contract["targetSelectionPenalties"])
     if "inventory_balance" in penalties:
+        # 2026-11 口径修订后 resource_balance_quality 的罚项恒为 0（碎片缺口由
+        # `orundum ≤ 碎片 × 10` 硬约束兜住，龙门币只有唯一价），这里保留分支只为兼容
+        # 老的 preset 契约，不再影响分数。
         balance = resource_balance_quality(daily)
         inventory_scale = 1.0 if mode == "balanced_orundum" else 100.0
         score -= float(balance["penalty"]) * inventory_scale
-    if "lmd_net_balance" in penalties and daily.orundum > 0.01:
-        score -= abs(daily.lmdNet) / 100.0
     if mode == "balanced_orundum" and daily.orundum > 0.01 and daily.lmdGross > 0.01:
         exp_support_ceiling = daily.lmdGross * 0.75
         if daily.exp > exp_support_ceiling:

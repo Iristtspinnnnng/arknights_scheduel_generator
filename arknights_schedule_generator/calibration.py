@@ -257,7 +257,10 @@ def layout_case(
 
 
 def case_to_dict(case: CalibrationCase, simulator: ProductionSimulator) -> dict[str, Any]:
-    report = simulator.evaluate(case.shifts)
+    # 单房间的原子用例是「这间房如果被喂饱能产多少」，所以允许吃库存（不做碎片裁剪）；
+    # 整条排班才要求每周期自给自足（`orundum ≤ 碎片 × 10`）。
+    isolated = len(case.shifts) == 1 and len(case.shifts[0].rooms) == 1
+    report = simulator.evaluate(case.shifts, allow_shard_draw=isolated)
     actual = report.dailyExpected
     differences = vector_difference(actual, case.expected)
     passed = vector_passed(differences, case.expected)

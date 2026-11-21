@@ -36,11 +36,16 @@ from arknights_schedule_generator.presets import preset_contract
 from arknights_schedule_generator.production import (
     ROOM_EFFICIENCY_WEIGHTS,
     TRADE_EQUIVALENT_PERCENT_SCORE,
+    EXP_SCORE_PER_UNIT,
     GUIDE_MANUFACTURE_LOOKUPS,
     GUIDE_LMD_TRADE_LOOKUPS,
+    LMD_SCORE_PER_UNIT,
+    ORUNDUM_PER_SHARD,
+    ORUNDUM_SCORE_PER_UNIT,
     ProductionReport,
     ProductionSimulator,
     ProductionVector,
+    SHARD_LMD_COST,
     fatigue_risk,
     resource_balance_quality,
     score_breakdown_for,
@@ -905,19 +910,18 @@ class ProductionModelTest(unittest.TestCase):
         assert report is not None
         contract = preset_contract("balanced-orundum")
         self.assertIn("inventory_balance", contract["targetSelectionPenalties"])
-        self.assertIn("lmd_net_balance", contract["targetSelectionPenalties"])
+        # 2026-11 口径修订：龙门币只有一个价（收入=支出），所以 `lmd_net_balance`
+        # （|lmdNet|/100）从契约里删除了；碎片也不再用罚项，改为
+        # `orundum <= 碎片 * 10` 硬约束。`inventory_balance` 的罚项恒为 0。
+        self.assertNotIn("lmd_net_balance", contract["targetSelectionPenalties"])
         daily = report.to_dict()["dailyExpected"]
         balance = resource_balance_quality(report.dailyExpected)
+        self.assertEqual(float(balance["penalty"]), 0.0)
         exp_support_ceiling = report.dailyExpected.lmdGross * 0.75
         exp_penalty = 0.0
         if report.dailyExpected.exp > exp_support_ceiling:
             exp_penalty = (report.dailyExpected.exp - exp_support_ceiling) / 60.0
-        expected = (
-            report.score
-            - float(balance["penalty"])
-            - abs(report.dailyExpected.lmdNet) / 100.0
-            - exp_penalty
-        )
+        expected = report.score - exp_penalty
 
         self.assertIn("lmdNet", daily)
         self.assertAlmostEqual(target_selection_score(result.mode, report), expected)
@@ -1180,8 +1184,12 @@ class ProductionModelTest(unittest.TestCase):
             report["presetContracts"]["balanced_orundum"]["lmdPolicy"],
             "lmd_net_balance_required",
         )
-        self.assertIn(
+        self.assertNotIn(
             "lmd_net_balance",
+            report["presetContracts"]["balanced_orundum"]["targetSelectionPenalties"],
+        )
+        self.assertIn(
+            "inventory_balance",
             report["presetContracts"]["balanced_orundum"]["targetSelectionPenalties"],
         )
         self.assertEqual(report["presetContracts"]["normal"]["lmdPolicy"], "lmd_net_primary")
@@ -2549,7 +2557,12 @@ class ProductionModelTest(unittest.TestCase):
             report["bestTargetCompatibleCurrent"]["score"],
         )
         self.assertEqual(report["bestCurrent"]["targetFit"]["fitLevel"], "off_target")
-        self.assertEqual(report["bestCurrent"]["dailyExpected"]["orundum"], 0.0)
+        # 2026-11 价格口径修订（handoff §9）后搓玉不再是结构性亏本，所以**标量最优本身
+        # 也可能是一条搓玉排班**（旧口径下这里恒为 0 玉）。这条用例真正要守的是
+        # 「标量最优 ≠ 目标兼容最优」，而不是「标量最优一定不搓玉」。
+        self.assertNotEqual(
+            report["bestCurrent"]["id"], report["bestTargetCompatibleCurrent"]["id"]
+        )
         self.assertEqual(report["bestTargetCompatibleCurrent"]["layout"], "243")
         self.assertEqual(report["bestTargetCompatibleCurrent"]["mode"], "balanced_orundum")
         self.assertGreater(report["bestTargetCompatibleCurrent"]["dailyExpected"]["orundum"], 0.0)
@@ -3488,6 +3501,59 @@ class ProductionModelTest(unittest.TestCase):
             self.assertAlmostEqual(trade_profile["throughputScale"], 1.0, places=6)
             self.assertAlmostEqual(trade_profile["referenceSpeedPercent"], 132.0)
 
+    def test_orundum_is_capped_by_the_shard_supply(self) -> None:
+        """碎片是玉的**硬约束**：没有碎片房时，玉产量必须是 0，差额记进 orundumIdle。"""
+        with TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            write_data(data_dir)
+            game_data = GameData.load(data_dir)
+            simulator = ProductionSimulator(game_data)
+            trading = room("trading_1", "TRADING", "O_DIAMOND")
+            starved = simulator.evaluate([ShiftPlan("A", "08:00", 12, [trading], [])])
+            fed = simulator.evaluate(
+                [ShiftPlan("A", "08:00", 12, [trading], [])], allow_shard_draw=True
+            )
+
+        self.assertEqual(starved.dailyExpected.orundum, 0.0)
+        self.assertGreater(starved.dailyExpected.orundumIdle, 0.0)
+        # 没有订单真的跑起来，就不该记碎片消耗。
+        self.assertEqual(starved.dailyExpected.shardDelta, 0.0)
+        # 单房间校准口径允许吃库存，所以同一个房间仍是满产。
+        self.assertGreater(fed.dailyExpected.orundum, 0.0)
+        self.assertEqual(fed.dailyExpected.orundumIdle, 0.0)
+
+    def test_shard_surplus_is_stock_not_a_penalty(self) -> None:
+        """碎片盈余不再扣分（它的龙门币成本已经通过 lmdNet 付过）。"""
+        surplus = ProductionVector(shardDelta=20.0, lmdNet=-1000.0, materialCosts={"4001": 1000.0})
+        deficit_free = ProductionVector(shardDelta=0.0, lmdNet=-1000.0, materialCosts={"4001": 1000.0})
+        self.assertEqual(score_breakdown_for(surplus), score_breakdown_for(deficit_free))
+        self.assertNotIn("shardBalance", score_breakdown_for(surplus))
+
+    def test_score_uses_a_single_lmd_price(self) -> None:
+        """龙门币只有一个价：收入与支出同价，旧的 gross/net/balance 三处叠加已经删除。"""
+        breakdown = score_breakdown_for(ProductionVector(lmdGross=1000.0, lmdNet=1000.0))
+        self.assertNotIn("lmdGross", breakdown)
+        self.assertNotIn("lmdNetBalance", breakdown)
+        self.assertAlmostEqual(breakdown["lmd"], LMD_SCORE_PER_UNIT * 1000.0, places=9)
+        # 收入侧与支出侧必须是同一个斜率。
+        spend = score_breakdown_for(ProductionVector(lmdGross=0.0, lmdNet=-1000.0))
+        earn = score_breakdown_for(ProductionVector(lmdGross=0.0, lmdNet=1000.0))
+        self.assertAlmostEqual(spend["lmd"], -earn["lmd"], places=9)
+
+    def test_orundum_price_covers_its_shard_cost(self) -> None:
+        """1 片碎片 = 10 玉；玉的计价必须高于碎片的龙门币成本，搓玉才是正收益。"""
+        self.assertAlmostEqual(ORUNDUM_PER_SHARD, 10.0)
+        revenue = ORUNDUM_SCORE_PER_UNIT * ORUNDUM_PER_SHARD
+        cost = LMD_SCORE_PER_UNIT * SHARD_LMD_COST
+        self.assertGreater(revenue, cost)
+        # 隐含汇率：1 玉 = 200 龙门币（配方成本 160，留 25% 效用溢价）。
+        self.assertAlmostEqual(revenue / cost, 200.0 / 160.0, places=6)
+
+    def test_exp_price_is_unchanged_by_the_price_revision(self) -> None:
+        breakdown = score_breakdown_for(ProductionVector(exp=1000.0))
+        self.assertAlmostEqual(breakdown["exp"], EXP_SCORE_PER_UNIT * 1000.0, places=9)
+        self.assertAlmostEqual(EXP_SCORE_PER_UNIT, 4.0 / 1000.0, places=12)
+
     def test_orundum_trade_does_not_clip_the_static_order_limit(self) -> None:
         """源石订单一律不裁剪（v2）；龙门币订单仍然受订单上限约束。"""
         # +200% 速度 ⇒ 18.18 单/12h，远超 L3 的 10 单上限；裁剪后的天花板是 200。
@@ -3544,7 +3610,9 @@ class ProductionModelTest(unittest.TestCase):
                 room_level=3,
                 slots=3,
             )
-            report = simulator.evaluate([ShiftPlan("A", "08:00", 12, [trade_room], [])])
+            report = simulator.evaluate(
+                [ShiftPlan("A", "08:00", 12, [trade_room], [])], allow_shard_draw=True
+            )
         return report.dailyExpected.orundum, report.roomReports[0]
 
     def test_yituliu_special_trade_lookup_for_shamare_tequila_butushu(self) -> None:
